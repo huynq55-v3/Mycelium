@@ -4,3 +4,28 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+
+[dependencies]
+core-crypto.workspace = true
+erasure-codec.workspace = true
+blockstore.workspace = true
+quota-manager.workspace = true
+
+libp2p.workspace = true
+tokio.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+serde_cbor.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+reqwest.workspace = true
+rand.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+tempfile = "3.17"
+tracing-subscriber.workspace = true

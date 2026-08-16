@@ -18,14 +18,19 @@ license = "MIT OR Apache-2.0"
 [workspace.dependencies]
 # Async Runtime
 tokio = { version = "1.43", features = ["full"] }
+futures = "0.3"
+async-trait = "0.1"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+serde_cbor = "0.11"
 
-# Error Handling
+# Error Handling & Logging
 thiserror = "2.0"
 anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Cryptography & Utils
 ed25519-dalek = { version = "2.1", features = ["rand_core", "serde"] }
@@ -41,8 +46,28 @@ reed-solomon-erasure = "6.0"
 # Embedded Key-Value Storage
 sled = "0.34"
 
+# HTTP Client
+reqwest = { version = "0.12", features = ["json"] }
+
+# Libp2p Networking
+libp2p = { version = "0.54", features = [
+    "tokio",
+    "tcp",
+    "noise",
+    "yamux",
+    "mdns",
+    "kad",
+    "request-response",
+    "pnet",
+    "cbor",
+    "serde",
+    "identify",
+    "ping"
+] }
+
 # Internal Crates
 core-crypto = { path = "crates/core-crypto" }
 erasure-codec = { path = "crates/erasure-codec" }
 blockstore = { path = "crates/blockstore" }
 quota-manager = { path = "crates/quota-manager" }
+network = { path = "crates/network" }
