@@ -290,7 +290,6 @@ impl IpcServer {
 
         package.save_to_file(&manifest_path)?;
 
-        // Phản hồi thành công
         Self::send_response(
             writer,
             &IpcResponse::UploadSuccess {
@@ -332,7 +331,27 @@ impl IpcServer {
             }
         };
 
-        // 1. Gom song song 10 shards từ DHT
+        // 1. Tự động kiểm tra và kết nối nhanh tới các peer từ Rendezvous nếu chưa có peer
+        let connected = self.service.get_connected_peers().await.unwrap_or_default();
+        if connected.is_empty() {
+            Self::send_response(
+                writer,
+                &IpcResponse::Progress {
+                    step: "connecting_peers".to_string(),
+                    current: 5,
+                    total: 100,
+                    message: "Đang đồng bộ và mở kết nối 2 chiều tới các peer từ Rendezvous...".to_string(),
+                },
+            )
+            .await?;
+
+            let rendezvous = RendezvousClient::new(&self.config.rendezvous_url);
+            let _ = self.service.bootstrap_from_rendezvous(&rendezvous, 20).await;
+            // Đợi 2.5 giây để tiến trình dial kết nối thành công
+            tokio::time::sleep(Duration::from_millis(2500)).await;
+        }
+
+        // 2. Gom song song 10 shards từ DHT
         let target_count = package.erasure_manifest.k_data_shards; // 10 shards
         Self::send_response(
             writer,
@@ -340,7 +359,7 @@ impl IpcServer {
                 step: "fetching_shards".to_string(),
                 current: 20,
                 total: 100,
-                message: format!("Đang truy vấn song song K={} shards từ DHT...", target_count),
+                message: format!("Đang truy vấn song song K={} shards từ mạng P2P...", target_count),
             },
         )
         .await?;
@@ -362,7 +381,7 @@ impl IpcServer {
             }
         };
 
-        // 2. Giải mã Reed-Solomon
+        // 3. Giải mã Reed-Solomon
         Self::send_response(
             writer,
             &IpcResponse::Progress {
@@ -394,7 +413,7 @@ impl IpcServer {
             }
         };
 
-        // 3. Giải mã AES-256-GCM
+        // 4. Giải mã AES-256-GCM
         Self::send_response(
             writer,
             &IpcResponse::Progress {
@@ -445,7 +464,7 @@ impl IpcServer {
             return Ok(());
         }
 
-        // 4. Ghi ra output_path
+        // 5. Ghi ra output_path
         if let Some(parent) = output_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -463,7 +482,6 @@ impl IpcServer {
         out_file.write_all(&decrypted_raw_data)?;
         out_file.flush()?;
 
-        // Phản hồi thành công
         Self::send_response(
             writer,
             &IpcResponse::DownloadSuccess {

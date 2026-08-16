@@ -10,20 +10,20 @@ use network::{P2PService, RendezvousClient};
 use quota_manager::QuotaManager;
 use tokio::signal;
 use tokio::sync::RwLock;
-use tracing::warn;
+use tracing::info;
 
 use crate::config::AppConfig;
 use crate::ipc::IpcServer;
 
-/// Tự động phát hiện IP Public thực của máy qua dịch vụ định danh IP nhẹ.
+/// Tự động phát hiện IP Public thực của máy (ưu tiên IPv6, fallback IPv4).
 async fn detect_public_or_lan_ip() -> String {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
 
-    // Thử truy vấn IP Public từ các dịch vụ IP resolver chuẩn
     let ip_services = [
+        "https://api64.ipify.org", // Tự trả về IPv6 nếu mạng hỗ trợ, hoặc IPv4
         "https://api.ipify.org",
         "https://ifconfig.me/ip",
         "https://icanhazip.com",
@@ -40,7 +40,6 @@ async fn detect_public_or_lan_ip() -> String {
         }
     }
 
-    // Nếu không có internet bên ngoài -> Fallback về 127.0.0.1
     "127.0.0.1".to_string()
 }
 
@@ -104,38 +103,46 @@ pub async fn handle_daemon(
         quota_manager.clone(),
     ).context("Khởi tạo P2PService thất bại")?;
 
-    let listen_multiaddr: Multiaddr = format!("/ip4/0.0.0.0/tcp/{}", port).parse()?;
-    service.listen_on(listen_multiaddr.clone()).await?;
-    println!("👂 P2P Network: Đang lắng nghe tại \x1b[1;36m{}\x1b[0m", listen_multiaddr);
+    // Lắng nghe Dual-Stack: IPv4
+    let ipv4_addr: Multiaddr = format!("/ip4/0.0.0.0/tcp/{}", port).parse()?;
+    service.listen_on(ipv4_addr.clone()).await?;
+    println!("👂 P2P Network: Đang lắng nghe tại \x1b[1;36m{}\x1b[0m", ipv4_addr);
+
+    // Lắng nghe IPv6 nếu hệ điều hành hỗ trợ
+    let ipv6_addr: Multiaddr = format!("/ip6/::/tcp/{}", port).parse()?;
+    if let Ok(_) = service.listen_on(ipv6_addr.clone()).await {
+        println!("🌐 IPv6 Dual-Stack: Đang lắng nghe tại \x1b[1;36m{}\x1b[0m", ipv6_addr);
+    }
 
     // 6. Xác định IP Public của node để công bố lên Rendezvous
     let resolved_ip = match public_ip_opt {
         Some(ip) => ip,
         None => detect_public_or_lan_ip().await,
     };
-    println!("🌐 Địa chỉ IP công bố: \x1b[1;32m{}\x1b[0m (Port: {})", resolved_ip, port);
 
-    // 7. Rendezvous Bootstrap & Heartbeat
+    let is_v6 = resolved_ip.contains(':');
+    let proto_prefix = if is_v6 { "ip6" } else { "ip4" };
+    println!("🌐 Địa chỉ IP công bố: \x1b[1;32m{}\x1b[0m ({})", resolved_ip, proto_prefix.to_uppercase());
+
+    // 7. Rendezvous Bootstrap, Heartbeat & Dynamic Peer Keeper
     let rendezvous = RendezvousClient::new(&rendezvous_url);
     println!("📡 Rendezvous Server: \x1b[1;34m{}\x1b[0m", rendezvous_url);
 
-    let public_multiaddr: Multiaddr = format!("/ip4/{}/tcp/{}/p2p/{}", resolved_ip, port, service.local_peer_id()).parse()?;
+    let public_multiaddr: Multiaddr = format!("/{}/{}/tcp/{}/p2p/{}", proto_prefix, resolved_ip, port, service.local_peer_id()).parse()?;
     
+    // Heartbeat định kỳ 10 phút
     let _heartbeat_handle = rendezvous.start_heartbeat_loop(
         service.local_peer_id(),
         public_multiaddr,
         Some("VN".to_string()),
     );
 
-    match service.bootstrap_from_rendezvous(&rendezvous, 20).await {
-        Ok(count) => {
-            println!("🌐 Bootstrap: Đã liên kết với \x1b[1;32m{}\x1b[0m peers từ mạng lưới", count);
-        }
-        Err(err) => {
-            warn!("Không thể kết nối bootstrap peers: {}", err);
-            println!("⚠️ Bootstrap qua HTTP thất bại, chuyển sang cơ chế mDNS mạng LAN.");
-        }
-    }
+    // Bootstrap peers ban đầu
+    let _ = service.bootstrap_from_rendezvous(&rendezvous, 20).await;
+
+    // Kích hoạt Dynamic Peer Keeper: Tự động tìm kiếm peer mới mỗi 15 giây và chủ động tạo kết nối Outbound 2 chiều
+    let _peer_keeper_handle = service.start_auto_discovery_loop(rendezvous.clone());
+    info!("Đã kích hoạt Dynamic Peer Keeper (chu kỳ 15s tự động kết nối 2 chiều)");
 
     // 8. Khởi động Local IPC Server cho Thin CLI Clients
     let ipc_server = Arc::new(IpcServer::new(

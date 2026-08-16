@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use blockstore::BlockStore;
 use core_crypto::{Identity, SwarmKey};
@@ -23,6 +24,8 @@ use crate::protocol::{
 };
 use crate::rendezvous::RendezvousClient;
 use crate::transport::build_transport;
+
+const PEER_DISCOVERY_INTERVAL: Duration = Duration::from_secs(15);
 
 /// Các lệnh nội bộ gửi từ `P2PHandle` tới background event loop của `P2PService`.
 enum P2PCommand {
@@ -72,14 +75,12 @@ impl P2PService {
         blockstore: BlockStore,
         quota_manager: Arc<RwLock<QuotaManager>>,
     ) -> Result<(Self, tokio::task::JoinHandle<()>), NetworkError> {
-        // Chuyển đổi Ed25519 dalek key thành libp2p keypair
         let secret_bytes = identity.secret_key_bytes();
         let libp2p_secret = libp2p::identity::ed25519::SecretKey::try_from_bytes(secret_bytes)
             .map_err(|e| NetworkError::TransportError(format!("Lỗi chuyển đổi SecretKey: {e}")))?;
         let keypair = Keypair::from(libp2p::identity::ed25519::Keypair::from(libp2p_secret));
         let local_peer_id = keypair.public().to_peer_id();
 
-        // Xây dựng Transport và Swarm Behaviour
         let transport = build_transport(&keypair, swarm_key)?;
         let behaviour = MyceliumBehaviour::new(&keypair)
             .map_err(|e| NetworkError::TransportError(format!("Lỗi khởi tạo Behaviour: {e}")))?;
@@ -100,7 +101,6 @@ impl P2PService {
             blockstore: blockstore.clone(),
         };
 
-        // Chạy Background Event Loop trên Tokio task
         let mut event_loop = P2PEventLoop::new(
             swarm,
             command_rx,
@@ -116,22 +116,18 @@ impl P2PService {
         Ok((service, handle))
     }
 
-    /// Lấy PeerId của node cục bộ.
     pub fn local_peer_id(&self) -> PeerId {
         self.local_peer_id
     }
 
-    /// Lấy tham chiếu `BlockStore` cục bộ.
     pub fn blockstore(&self) -> &BlockStore {
         &self.blockstore
     }
 
-    /// Lấy tham chiếu `QuotaManager`.
     pub fn quota_manager(&self) -> &Arc<RwLock<QuotaManager>> {
         &self.quota_manager
     }
 
-    /// Lắng nghe trên một Multiaddr chỉ định (ví dụ `/ip4/0.0.0.0/tcp/4001`).
     pub async fn listen_on(&self, addr: Multiaddr) -> Result<Multiaddr, NetworkError> {
         let (tx, rx) = oneshot::channel();
         self.command_tx
@@ -144,7 +140,6 @@ impl P2PService {
         rx.await.map_err(|e| NetworkError::ChannelClosed(e.to_string()))?
     }
 
-    /// Kết nối tới một địa chỉ Multiaddr.
     pub async fn dial(&self, addr: Multiaddr) -> Result<(), NetworkError> {
         let (tx, rx) = oneshot::channel();
         self.command_tx
@@ -157,7 +152,6 @@ impl P2PService {
         rx.await.map_err(|e| NetworkError::ChannelClosed(e.to_string()))?
     }
 
-    /// Nạp danh sách peers từ Rendezvous Server và thêm vào Kademlia Routing Table.
     pub async fn bootstrap_from_rendezvous(
         &self,
         rendezvous: &RendezvousClient,
@@ -179,7 +173,21 @@ impl P2PService {
         rx.await.map_err(|e| NetworkError::ChannelClosed(e.to_string()))?
     }
 
-    /// Phân phối các mảnh shards (thông thường 40 shards từ erasure-codec) đến các peer trong mạng P2P.
+    /// Khởi động vòng lặp tự động duy trì kết nối và tìm kiếm Peer mới qua Rendezvous Server (mỗi 15 giây).
+    pub fn start_auto_discovery_loop(
+        &self,
+        rendezvous: RendezvousClient,
+    ) -> tokio::task::JoinHandle<()> {
+        let service = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(PEER_DISCOVERY_INTERVAL);
+            loop {
+                interval.tick().await;
+                let _ = service.bootstrap_from_rendezvous(&rendezvous, 20).await;
+            }
+        })
+    }
+
     pub async fn distribute_shards(&self, shards: Vec<Shard>) -> Result<(), NetworkError> {
         let (tx, rx) = oneshot::channel();
         self.command_tx
@@ -192,7 +200,6 @@ impl P2PService {
         rx.await.map_err(|e| NetworkError::ChannelClosed(e.to_string()))?
     }
 
-    /// Truy vấn song song mạng lưới để gom đủ tối thiểu `target_count` (10) shards sớm nhất thì dừng lại ngay.
     pub async fn fetch_shards_parallel(
         &self,
         hashes: Vec<String>,
@@ -210,7 +217,6 @@ impl P2PService {
         rx.await.map_err(|e| NetworkError::ChannelClosed(e.to_string()))?
     }
 
-    /// Lấy danh sách các PeerId đang kết nối trực tiếp.
     pub async fn get_connected_peers(&self) -> Result<Vec<PeerId>, NetworkError> {
         let (tx, rx) = oneshot::channel();
         self.command_tx
@@ -220,7 +226,6 @@ impl P2PService {
         rx.await.map_err(|e| NetworkError::ChannelClosed(e.to_string()))
     }
 
-    /// Lấy danh sách các địa chỉ đang lắng nghe (Listeners).
     pub async fn get_listeners(&self) -> Result<Vec<Multiaddr>, NetworkError> {
         let (tx, rx) = oneshot::channel();
         self.command_tx
@@ -231,16 +236,14 @@ impl P2PService {
     }
 }
 
-/// Trạng thái yêu cầu song song đang chờ phản hồi từ mạng
 struct PendingFetchRequest {
     target_count: usize,
     collected_shards: Vec<Shard>,
     collected_indices: HashSet<usize>,
-    hashes_map: HashMap<String, usize>, // hash -> original_index
+    hashes_map: HashMap<String, usize>,
     respond_to: oneshot::Sender<Result<Vec<Shard>, NetworkError>>,
 }
 
-/// Background Event Loop của `P2PService`.
 struct P2PEventLoop {
     swarm: Swarm<MyceliumBehaviour>,
     command_rx: mpsc::Receiver<P2PCommand>,
@@ -248,7 +251,8 @@ struct P2PEventLoop {
     quota_manager: Arc<RwLock<QuotaManager>>,
     local_peer_id: PeerId,
     connected_peers: HashSet<PeerId>,
-    pending_fetches: HashMap<request_response::OutboundRequestId, usize>, // req_id -> fetch_session_id
+    known_peer_addrs: HashMap<PeerId, HashSet<Multiaddr>>,
+    pending_fetches: HashMap<request_response::OutboundRequestId, usize>,
     fetch_sessions: HashMap<usize, PendingFetchRequest>,
     next_fetch_session_id: usize,
 }
@@ -268,6 +272,7 @@ impl P2PEventLoop {
             quota_manager,
             local_peer_id,
             connected_peers: HashSet::new(),
+            known_peer_addrs: HashMap::new(),
             pending_fetches: HashMap::new(),
             fetch_sessions: HashMap::new(),
             next_fetch_session_id: 1,
@@ -279,12 +284,9 @@ impl P2PEventLoop {
 
         loop {
             tokio::select! {
-                // 1. Nhận lệnh từ P2PHandle
                 Some(cmd) = self.command_rx.recv() => {
                     self.handle_command(cmd).await;
                 }
-
-                // 2. Xử lý các sự kiện Swarm P2P
                 event = self.swarm.select_next_some() => {
                     self.handle_swarm_event(event).await;
                 }
@@ -318,11 +320,26 @@ impl P2PEventLoop {
                 let mut added = 0;
                 for addr in peers {
                     if let Some(peer_id) = extract_peer_id(&addr) {
+                        // Không tự dial tới chính mình
+                        if peer_id == self.local_peer_id {
+                            continue;
+                        }
+
+                        self.known_peer_addrs
+                            .entry(peer_id)
+                            .or_default()
+                            .insert(addr.clone());
+
                         self.swarm
                             .behaviour_mut()
                             .kademlia
                             .add_address(&peer_id, addr.clone());
-                        let _ = self.swarm.dial(addr);
+
+                        // Chủ động dial outbound nếu chưa kết nối
+                        if !self.connected_peers.contains(&peer_id) {
+                            debug!("Chủ động kết nối (Outbound dial) tới peer: {} ({})", peer_id, addr);
+                            let _ = self.swarm.dial(addr);
+                        }
                         added += 1;
                     }
                 }
@@ -332,7 +349,6 @@ impl P2PEventLoop {
             P2PCommand::DistributeShards { shards, respond_to } => {
                 let connected: Vec<PeerId> = self.connected_peers.iter().cloned().collect();
                 if connected.is_empty() {
-                    // Nếu chưa có peer kết nối, lưu cục bộ vào blockstore
                     for shard in &shards {
                         let _ = self.blockstore.put_shard(&shard.hash, &shard.data);
                         let key = RecordKey::new(&shard.hash.as_bytes());
@@ -342,7 +358,6 @@ impl P2PEventLoop {
                     return;
                 }
 
-                // Phân phối luân phiên các shards tới các peers
                 let total_peers = connected.len();
                 for (i, shard) in shards.into_iter().enumerate() {
                     let target_peer = connected[i % total_peers];
@@ -367,7 +382,6 @@ impl P2PEventLoop {
                 let mut remaining_hashes = Vec::new();
                 let mut hashes_map = HashMap::new();
 
-                // 1. Kiểm tra trong local blockstore trước
                 for (idx, hash) in hashes.iter().enumerate() {
                     hashes_map.insert(hash.clone(), idx);
                     if let Ok(Some(data)) = self.blockstore.get_shard(hash) {
@@ -381,10 +395,19 @@ impl P2PEventLoop {
                     }
                 }
 
-                // Nếu đã đủ target_count ngay trong local blockstore, trả về ngay lập tức
                 if collected_shards.len() >= target_count {
                     let _ = respond_to.send(Ok(collected_shards));
                     return;
+                }
+
+                // Nếu chưa có connected_peers, thử re-dial các known peers
+                if self.connected_peers.is_empty() {
+                    for (peer_id, addrs) in &self.known_peer_addrs {
+                        for addr in addrs {
+                            debug!("Đang thử kết nối lại tới known peer {} ({})", peer_id, addr);
+                            let _ = self.swarm.dial(addr.clone());
+                        }
+                    }
                 }
 
                 let connected: Vec<PeerId> = self.connected_peers.iter().cloned().collect();
@@ -393,7 +416,6 @@ impl P2PEventLoop {
                     return;
                 }
 
-                // Tạo Fetch Session mới
                 let session_id = self.next_fetch_session_id;
                 self.next_fetch_session_id += 1;
 
@@ -413,7 +435,6 @@ impl P2PEventLoop {
                     },
                 );
 
-                // Gửi truy vấn Pull song song tới tất cả các peers đã kết nối
                 for hash in remaining_hashes {
                     for peer in &connected {
                         let req = ShardRequest::Pull(PullShard { hash: hash.clone() });
@@ -442,44 +463,55 @@ impl P2PEventLoop {
             SwarmEvent::ConnectionEstablished {
                 peer_id, endpoint, ..
             } => {
-                info!("Đã kết nối thành công với peer: {}", peer_id);
+                info!("🎉 Đã thiết lập kết nối 2 chiều thành công với peer: {}", peer_id);
                 self.connected_peers.insert(peer_id);
                 if let ConnectedPoint::Dialer { address, .. } = endpoint {
                     self.swarm
                         .behaviour_mut()
                         .kademlia
-                        .add_address(&peer_id, address);
+                        .add_address(&peer_id, address.clone());
+                    self.known_peer_addrs
+                        .entry(peer_id)
+                        .or_default()
+                        .insert(address);
                 }
             }
             SwarmEvent::ConnectionClosed { peer_id, .. } => {
-                debug!("Đã ngắt kết nối với peer: {}", peer_id);
+                debug!("Ngắt kết nối với peer: {}", peer_id);
                 self.connected_peers.remove(&peer_id);
             }
             SwarmEvent::Behaviour(MyceliumBehaviourEvent::Mdns(mdns_event)) => match mdns_event {
                 MdnsEvent::Discovered(list) => {
                     for (peer_id, multiaddr) in list {
-                        debug!("mDNS phát hiện peer LAN: {} tại {}", peer_id, multiaddr);
-                        self.swarm
-                            .behaviour_mut()
-                            .kademlia
-                            .add_address(&peer_id, multiaddr.clone());
-                        let _ = self.swarm.dial(multiaddr);
+                        if peer_id != self.local_peer_id {
+                            debug!("mDNS phát hiện peer LAN: {} tại {}", peer_id, multiaddr);
+                            self.swarm
+                                .behaviour_mut()
+                                .kademlia
+                                .add_address(&peer_id, multiaddr.clone());
+                            let _ = self.swarm.dial(multiaddr);
+                        }
                     }
                 }
-                MdnsEvent::Expired(list) => {
-                    for (peer_id, _) in list {
-                        trace!("mDNS peer hết hạn: {}", peer_id);
-                    }
-                }
+                MdnsEvent::Expired(_) => {}
             },
             SwarmEvent::Behaviour(MyceliumBehaviourEvent::RequestResponse(req_event)) => {
                 self.handle_req_resp_event(req_event).await;
             }
-            SwarmEvent::Behaviour(MyceliumBehaviourEvent::Kademlia(kad_event)) => {
-                trace!("Kademlia event: {:?}", kad_event);
-            }
             SwarmEvent::Behaviour(MyceliumBehaviourEvent::Identify(identify_event)) => {
-                trace!("Identify event: {:?}", identify_event);
+                if let libp2p::identify::Event::Received { peer_id, info, .. } = identify_event {
+                    trace!("Nhận thông tin Identify từ {}: {:?}", peer_id, info.listen_addrs);
+                    for addr in info.listen_addrs {
+                        self.swarm
+                            .behaviour_mut()
+                            .kademlia
+                            .add_address(&peer_id, addr.clone());
+                        self.known_peer_addrs
+                            .entry(peer_id)
+                            .or_default()
+                            .insert(addr);
+                    }
+                }
             }
             SwarmEvent::NewListenAddr { address, .. } => {
                 info!("Node đang lắng nghe tại Multiaddr: {}", address);
@@ -493,7 +525,6 @@ impl P2PEventLoop {
         event: request_response::Event<ShardRequest, ShardResponse>,
     ) {
         match event {
-            // 1. Nhận Request từ một peer khác gửi đến
             request_response::Event::Message {
                 peer,
                 message:
@@ -503,7 +534,6 @@ impl P2PEventLoop {
                         channel,
                     },
             } => match request {
-                // Nhận PushShard: kiểm tra QuotaManager -> lưu BlockStore -> thông báo DHT
                 ShardRequest::Push(push) => {
                     let shard_len = push.data.len() as u64;
                     let quota_guard = self.quota_manager.read().await;
@@ -511,7 +541,6 @@ impl P2PEventLoop {
                     if quota_guard.can_store_incoming_shard(&self.blockstore, shard_len) {
                         drop(quota_guard);
 
-                        // Lưu shard vào BlockStore
                         if let Err(e) = self.blockstore.put_shard(&push.hash, &push.data) {
                             error!("Lỗi khi ghi shard vào blockstore: {}", e);
                             let resp = ShardResponse::Push(PushResponse {
@@ -526,7 +555,6 @@ impl P2PEventLoop {
                             return;
                         }
 
-                        // Thông báo DHT rằng node này là provider của shard hash
                         let key = RecordKey::new(&push.hash.as_bytes());
                         let _ = self.swarm.behaviour_mut().kademlia.start_providing(key);
 
@@ -553,7 +581,6 @@ impl P2PEventLoop {
                             .send_response(channel, resp);
                     }
                 }
-                // Nhận PullShard: đọc từ BlockStore -> gửi byte dữ liệu
                 ShardRequest::Pull(pull) => {
                     let data = self.blockstore.get_shard(&pull.hash).unwrap_or(None);
                     debug!(
@@ -570,8 +597,6 @@ impl P2PEventLoop {
                         .send_response(channel, resp);
                 }
             },
-
-            // 2. Nhận Response từ yêu cầu Outbound mà node đã gửi đi trước đó
             request_response::Event::Message {
                 peer: _,
                 message:
@@ -593,7 +618,6 @@ impl P2PEventLoop {
                                         hash,
                                     });
 
-                                    // Nếu đã thu thập đủ target_count -> hoàn thành session ngay lập tức
                                     if session.collected_shards.len() >= session.target_count {
                                         if let Some(finished_session) =
                                             self.fetch_sessions.remove(&session_id)
@@ -614,7 +638,6 @@ impl P2PEventLoop {
     }
 }
 
-/// Helper trích xuất PeerId từ Multiaddr nếu có đuôi `/p2p/<peer_id>`.
 fn extract_peer_id(addr: &Multiaddr) -> Option<PeerId> {
     for protocol in addr.iter() {
         if let libp2p::multiaddr::Protocol::P2p(peer_id) = protocol {
