@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core-crypto",
+    "crates/erasure-codec",
+    "crates/blockstore",
+    "crates/quota-manager",
+    "crates/network",
+    "crates/cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Mycelium Team"]
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+# Async Runtime
+tokio = { version = "1.43", features = ["full"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Error Handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Cryptography & Utils
+ed25519-dalek = { version = "2.1", features = ["rand_core", "serde"] }
+aes-gcm = "0.10"
+rand = "0.8"
+sha2 = "0.10"
+hex = { version = "0.4", features = ["serde"] }
+dirs = "6.0"
+
+# Internal Crates
+core-crypto = { path = "crates/core-crypto" }
