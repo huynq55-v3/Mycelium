@@ -2,10 +2,8 @@
  * Mycelium P2P Rendezvous / Bootstrap Server
  * Deno Deploy with Deno KV (Zero-dependency, Edge Native)
  *
- * Endpoints:
- *  - GET  /health           : Trả về trạng thái & số lượng peer đang hoạt động
- *  - POST /heartbeat        : Đăng ký / làm mới trạng thái active của một node (TTL 15 phút)
- *  - GET  /peers?limit=10   : Lấy danh sách multiaddr active (ưu tiên cross-region, Fisher-Yates shuffle)
+ * Tự động phát hiện IP Public thực của client qua Cloudflare / Proxy headers
+ * để các máy khác nhau trên toàn cầu có thể kết nối trực tiếp với nhau.
  */
 
 interface PeerRecord {
@@ -34,9 +32,6 @@ const CORS_HEADERS: Record<string, string> = {
 // Khởi tạo Deno KV
 const kv = await Deno.openKv();
 
-/**
- * Hàm xáo trộn mảng ngẫu nhiên (Fisher-Yates Shuffle)
- */
 function shuffleArray<T>(array: T[]): T[] {
   const arr = [...array];
   for (let i = arr.length - 1; i > 0; i--) {
@@ -46,9 +41,6 @@ function shuffleArray<T>(array: T[]): T[] {
   return arr;
 }
 
-/**
- * Trả về response JSON kèm CORS
- */
 function jsonResponse(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data, null, 2), {
     status,
@@ -59,10 +51,6 @@ function jsonResponse(data: unknown, status = 200): Response {
   });
 }
 
-/**
- * Validate định dạng Multiaddr cơ bản:
- * Bắt đầu bằng /ip4/ hoặc /ip6/ hoặc /dns4/ hoặc /dns6/ và chứa /p2p/
- */
 function isValidMultiaddr(addr: string): boolean {
   if (typeof addr !== "string") return false;
   const isIpOrDns =
@@ -76,8 +64,42 @@ function isValidMultiaddr(addr: string): boolean {
 }
 
 /**
- * Dọn dẹp các peer quá hạn (lazy cleanup hoặc query filter)
+ * Trích xuất IP Public thực tế của Client từ Cloudflare / Proxy headers
  */
+function extractClientPublicIp(req: Request): string | null {
+  const cfIp = req.headers.get("cf-connecting-ip");
+  if (cfIp) return cfIp.trim();
+
+  const forwarded = req.headers.get("x-forwarded-for");
+  if (forwarded) {
+    const firstIp = forwarded.split(",")[0].trim();
+    if (firstIp && firstIp !== "127.0.0.1" && firstIp !== "::1") {
+      return firstIp;
+    }
+  }
+
+  const realIp = req.headers.get("x-real-ip");
+  if (realIp) return realIp.trim();
+
+  return null;
+}
+
+/**
+ * Chuẩn hóa Multiaddr: Thay thế 127.0.0.1 hoặc 0.0.0.0 bằng IP Public thực tế nếu có
+ */
+function resolveMultiaddrWithPublicIp(rawMultiaddr: string, publicIp: string | null): string {
+  if (!publicIp) return rawMultiaddr;
+
+  // Nếu client gửi 127.0.0.1 hoặc 0.0.0.0 -> Thay bằng Public IP thật
+  if (rawMultiaddr.startsWith("/ip4/127.0.0.1/") || rawMultiaddr.startsWith("/ip4/0.0.0.0/")) {
+    return rawMultiaddr
+      .replace("/ip4/127.0.0.1/", `/ip4/${publicIp}/`)
+      .replace("/ip4/0.0.0.0/", `/ip4/${publicIp}/`);
+  }
+
+  return rawMultiaddr;
+}
+
 async function getActivePeers(): Promise<PeerRecord[]> {
   const now = Date.now();
   const entries = kv.list<PeerRecord>({ prefix: ["peers"] });
@@ -88,7 +110,6 @@ async function getActivePeers(): Promise<PeerRecord[]> {
     if (now - peer.last_seen <= PEER_TTL_MS) {
       active.push(peer);
     } else {
-      // Xóa peer đã hết hạn khỏi KV để tiết kiệm dung lượng
       await kv.delete(entry.key);
     }
   }
@@ -100,7 +121,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
   const url = new URL(req.url);
   const method = req.method;
 
-  // 1. Xử lý CORS Preflight OPTIONS
+  // 1. CORS Preflight
   if (method === "OPTIONS") {
     return new Response(null, {
       status: 204,
@@ -108,7 +129,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
     });
   }
 
-  // 2. Health check endpoint (GET / hoặc GET /health)
+  // 2. Health check
   if (method === "GET" && (url.pathname === "/" || url.pathname === "/health")) {
     const activePeers = await getActivePeers();
     return jsonResponse({
@@ -120,7 +141,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
     });
   }
 
-  // 3. Heartbeat endpoint (POST /heartbeat)
+  // 3. Heartbeat (POST /heartbeat)
   if (method === "POST" && url.pathname === "/heartbeat") {
     try {
       const payload: HeartbeatPayload = await req.json();
@@ -139,7 +160,10 @@ Deno.serve(async (req: Request): Promise<Response> => {
         );
       }
 
-      // Phát hiện Region qua Cloudflare/Deno geo headers hoặc payload fallback
+      // Phát hiện IP Public và tự động thay thế 127.0.0.1
+      const clientPublicIp = extractClientPublicIp(req);
+      const resolvedMultiaddr = resolveMultiaddrWithPublicIp(payload.multiaddr, clientPublicIp);
+
       const geoRegion =
         req.headers.get("cf-ipcountry") ||
         req.headers.get("x-client-geo-region") ||
@@ -148,12 +172,11 @@ Deno.serve(async (req: Request): Promise<Response> => {
 
       const record: PeerRecord = {
         peer_id: payload.peer_id,
-        multiaddr: payload.multiaddr,
+        multiaddr: resolvedMultiaddr,
         region: geoRegion.toUpperCase(),
         last_seen: Date.now(),
       };
 
-      // Lưu vào Deno KV với key ["peers", peer_id]
       await kv.set(["peers", payload.peer_id], record, {
         expireIn: PEER_TTL_MS,
       });
@@ -161,6 +184,8 @@ Deno.serve(async (req: Request): Promise<Response> => {
       return jsonResponse({
         status: "registered",
         peer_id: record.peer_id,
+        multiaddr: record.multiaddr,
+        detected_public_ip: clientPublicIp,
         region: record.region,
         expires_in_seconds: PEER_TTL_MS / 1000,
       });
@@ -177,7 +202,6 @@ Deno.serve(async (req: Request): Promise<Response> => {
     const limitParam = parseInt(url.searchParams.get("limit") || `${DEFAULT_LIMIT}`);
     const limit = Math.min(Math.max(limitParam || DEFAULT_LIMIT, 1), MAX_LIMIT);
 
-    // Xác định client region để ưu tiên cross-region
     const clientRegion = (
       url.searchParams.get("region") ||
       req.headers.get("cf-ipcountry") ||
@@ -186,7 +210,6 @@ Deno.serve(async (req: Request): Promise<Response> => {
 
     const activePeers = await getActivePeers();
 
-    // Tách peer thành 2 nhóm: khác vùng (cross-region) và cùng vùng (local-region)
     const foreignPeers: PeerRecord[] = [];
     const localPeers: PeerRecord[] = [];
 
@@ -198,11 +221,9 @@ Deno.serve(async (req: Request): Promise<Response> => {
       }
     }
 
-    // Xáo trộn ngẫu nhiên từng nhóm bằng Fisher-Yates shuffle
     const shuffledForeign = shuffleArray(foreignPeers);
     const shuffledLocal = shuffleArray(localPeers);
 
-    // Ưu tiên cross-region lên đầu danh sách để chống Network Partitioning
     const merged = [...shuffledForeign, ...shuffledLocal];
     const selected = merged.slice(0, limit);
 
@@ -214,6 +235,5 @@ Deno.serve(async (req: Request): Promise<Response> => {
     });
   }
 
-  // Fallback 404
   return jsonResponse({ error: "Endpoint not found" }, 404);
 });

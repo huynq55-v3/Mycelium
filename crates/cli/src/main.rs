@@ -55,6 +55,10 @@ enum Commands {
         /// URL của Rendezvous / Bootstrap Server
         #[arg(short, long)]
         rendezvous_url: Option<String>,
+
+        /// Địa chỉ IP công cộng tĩnh (nếu cấu hình Port-Forwarding/VPS)
+        #[arg(long)]
+        public_ip: Option<String>,
     },
 
     /// [CLIENT MODE] Mã hóa và phân tán tệp tin lên mạng lưới P2P thông qua Daemon
@@ -106,8 +110,9 @@ async fn main() -> Result<()> {
         Commands::Daemon {
             port,
             rendezvous_url,
+            public_ip,
         } => {
-            commands::daemon::handle_daemon(port, rendezvous_url).await?;
+            commands::daemon::handle_daemon(port, rendezvous_url, public_ip).await?;
         }
         Commands::Upload { file_path } => {
             commands::upload::handle_upload(file_path).await?;

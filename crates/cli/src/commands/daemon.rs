@@ -14,7 +14,11 @@ use tracing::warn;
 use crate::config::AppConfig;
 use crate::ipc::IpcServer;
 
-pub async fn handle_daemon(port_opt: Option<u16>, rendezvous_url_opt: Option<String>) -> Result<()> {
+pub async fn handle_daemon(
+    port_opt: Option<u16>,
+    rendezvous_url_opt: Option<String>,
+    public_ip_opt: Option<String>,
+) -> Result<()> {
     let config = AppConfig::load_or_default();
     let port = port_opt.unwrap_or(config.port);
     let rendezvous_url = rendezvous_url_opt.unwrap_or(config.rendezvous_url.clone());
@@ -78,7 +82,10 @@ pub async fn handle_daemon(port_opt: Option<u16>, rendezvous_url_opt: Option<Str
     let rendezvous = RendezvousClient::new(&rendezvous_url);
     println!("📡 Rendezvous Server: \x1b[1;34m{}\x1b[0m", rendezvous_url);
 
-    let public_multiaddr: Multiaddr = format!("/ip4/127.0.0.1/tcp/{}/p2p/{}", port, service.local_peer_id()).parse()?;
+    // Xác định IP công bố lên Rendezvous (Ưu tiên public_ip chỉ định hoặc 0.0.0.0 để server tự động phát hiện IP thật)
+    let advertised_ip = public_ip_opt.unwrap_or_else(|| "0.0.0.0".to_string());
+    let public_multiaddr: Multiaddr = format!("/ip4/{}/tcp/{}/p2p/{}", advertised_ip, port, service.local_peer_id()).parse()?;
+    
     let _heartbeat_handle = rendezvous.start_heartbeat_loop(
         service.local_peer_id(),
         public_multiaddr,
