@@ -473,6 +473,7 @@ dependencies = [
  "network",
  "quota-manager",
  "rand 0.8.7",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",

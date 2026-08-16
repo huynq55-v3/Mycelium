@@ -1,9 +1,6 @@
 /**
  * Mycelium P2P Rendezvous / Bootstrap Server
  * Deno Deploy with Deno KV (Zero-dependency, Edge Native)
- *
- * Tự động phát hiện IP Public thực của client qua Cloudflare / Proxy headers
- * để các máy khác nhau trên toàn cầu có thể kết nối trực tiếp với nhau.
  */
 
 interface PeerRecord {
@@ -64,9 +61,9 @@ function isValidMultiaddr(addr: string): boolean {
 }
 
 /**
- * Trích xuất IP Public thực tế của Client từ Cloudflare / Proxy headers
+ * Trích xuất IP Public thực tế của Client
  */
-function extractClientPublicIp(req: Request): string | null {
+function extractClientPublicIp(req: Request, info?: Deno.ServeHandlerInfo): string | null {
   const cfIp = req.headers.get("cf-connecting-ip");
   if (cfIp) return cfIp.trim();
 
@@ -81,16 +78,19 @@ function extractClientPublicIp(req: Request): string | null {
   const realIp = req.headers.get("x-real-ip");
   if (realIp) return realIp.trim();
 
+  if (info && info.remoteAddr && "hostname" in info.remoteAddr) {
+    const host = (info.remoteAddr as Deno.NetAddr).hostname;
+    if (host && host !== "127.0.0.1" && host !== "::1") {
+      return host;
+    }
+  }
+
   return null;
 }
 
-/**
- * Chuẩn hóa Multiaddr: Thay thế 127.0.0.1 hoặc 0.0.0.0 bằng IP Public thực tế nếu có
- */
 function resolveMultiaddrWithPublicIp(rawMultiaddr: string, publicIp: string | null): string {
   if (!publicIp) return rawMultiaddr;
 
-  // Nếu client gửi 127.0.0.1 hoặc 0.0.0.0 -> Thay bằng Public IP thật
   if (rawMultiaddr.startsWith("/ip4/127.0.0.1/") || rawMultiaddr.startsWith("/ip4/0.0.0.0/")) {
     return rawMultiaddr
       .replace("/ip4/127.0.0.1/", `/ip4/${publicIp}/`)
@@ -117,7 +117,7 @@ async function getActivePeers(): Promise<PeerRecord[]> {
   return active;
 }
 
-Deno.serve(async (req: Request): Promise<Response> => {
+Deno.serve(async (req: Request, info: Deno.ServeHandlerInfo): Promise<Response> => {
   const url = new URL(req.url);
   const method = req.method;
 
@@ -160,8 +160,8 @@ Deno.serve(async (req: Request): Promise<Response> => {
         );
       }
 
-      // Phát hiện IP Public và tự động thay thế 127.0.0.1
-      const clientPublicIp = extractClientPublicIp(req);
+      // Phát hiện IP Public và tự động thay thế
+      const clientPublicIp = extractClientPublicIp(req, info);
       const resolvedMultiaddr = resolveMultiaddrWithPublicIp(payload.multiaddr, clientPublicIp);
 
       const geoRegion =

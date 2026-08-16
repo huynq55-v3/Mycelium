@@ -28,3 +28,4 @@ dirs.workspace = true
 hex.workspace = true
 rand.workspace = true
 libp2p.workspace = true
+reqwest.workspace = true

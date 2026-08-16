@@ -1,3 +1,4 @@
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,6 +14,35 @@ use tracing::warn;
 
 use crate::config::AppConfig;
 use crate::ipc::IpcServer;
+
+/// Tự động phát hiện IP Public thực của máy qua dịch vụ định danh IP nhẹ.
+async fn detect_public_or_lan_ip() -> String {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+
+    // Thử truy vấn IP Public từ các dịch vụ IP resolver chuẩn
+    let ip_services = [
+        "https://api.ipify.org",
+        "https://ifconfig.me/ip",
+        "https://icanhazip.com",
+    ];
+
+    for url in ip_services {
+        if let Ok(res) = client.get(url).send().await {
+            if let Ok(ip_text) = res.text().await {
+                let trimmed = ip_text.trim();
+                if trimmed.parse::<IpAddr>().is_ok() {
+                    return trimmed.to_string();
+                }
+            }
+        }
+    }
+
+    // Nếu không có internet bên ngoài -> Fallback về 127.0.0.1
+    "127.0.0.1".to_string()
+}
 
 pub async fn handle_daemon(
     port_opt: Option<u16>,
@@ -78,13 +108,18 @@ pub async fn handle_daemon(
     service.listen_on(listen_multiaddr.clone()).await?;
     println!("👂 P2P Network: Đang lắng nghe tại \x1b[1;36m{}\x1b[0m", listen_multiaddr);
 
-    // 6. Rendezvous Bootstrap & Heartbeat
+    // 6. Xác định IP Public của node để công bố lên Rendezvous
+    let resolved_ip = match public_ip_opt {
+        Some(ip) => ip,
+        None => detect_public_or_lan_ip().await,
+    };
+    println!("🌐 Địa chỉ IP công bố: \x1b[1;32m{}\x1b[0m (Port: {})", resolved_ip, port);
+
+    // 7. Rendezvous Bootstrap & Heartbeat
     let rendezvous = RendezvousClient::new(&rendezvous_url);
     println!("📡 Rendezvous Server: \x1b[1;34m{}\x1b[0m", rendezvous_url);
 
-    // Xác định IP công bố lên Rendezvous (Ưu tiên public_ip chỉ định hoặc 0.0.0.0 để server tự động phát hiện IP thật)
-    let advertised_ip = public_ip_opt.unwrap_or_else(|| "0.0.0.0".to_string());
-    let public_multiaddr: Multiaddr = format!("/ip4/{}/tcp/{}/p2p/{}", advertised_ip, port, service.local_peer_id()).parse()?;
+    let public_multiaddr: Multiaddr = format!("/ip4/{}/tcp/{}/p2p/{}", resolved_ip, port, service.local_peer_id()).parse()?;
     
     let _heartbeat_handle = rendezvous.start_heartbeat_loop(
         service.local_peer_id(),
@@ -102,7 +137,7 @@ pub async fn handle_daemon(
         }
     }
 
-    // 7. Khởi động Local IPC Server cho Thin CLI Clients
+    // 8. Khởi động Local IPC Server cho Thin CLI Clients
     let ipc_server = Arc::new(IpcServer::new(
         service.clone(),
         identity.clone(),
@@ -123,7 +158,7 @@ pub async fn handle_daemon(
     println!("✨ Node P2P đang hoạt động ổn định. Nhấn \x1b[1;31mCtrl+C\x1b[0m để dừng an toàn.");
     println!("============================================================");
 
-    // 8. Lắng nghe tín hiệu dừng Ctrl+C / SIGINT
+    // 9. Lắng nghe tín hiệu dừng Ctrl+C / SIGINT
     signal::ctrl_c().await.context("Lỗi lắng nghe tín hiệu Ctrl+C")?;
 
     println!("\n🛑 Đang tiến hành tắt an toàn (Graceful Shutdown)...");
