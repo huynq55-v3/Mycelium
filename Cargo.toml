@@ -17,7 +17,7 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 # Async Runtime
-tokio = { version = "1.43", features = ["full"] }
+tokio = { version = "1.43", features = ["full", "signal"] }
 futures = "0.3"
 async-trait = "0.1"
 
@@ -31,6 +31,10 @@ thiserror = "2.0"
 anyhow = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI & UX
+clap = { version = "4.5", features = ["derive", "env"] }
+indicatif = "0.17"
 
 # Cryptography & Utils
 ed25519-dalek = { version = "2.1", features = ["rand_core", "serde"] }
@@ -71,3 +75,4 @@ erasure-codec = { path = "crates/erasure-codec" }
 blockstore = { path = "crates/blockstore" }
 quota-manager = { path = "crates/quota-manager" }
 network = { path = "crates/network" }
+cli = { path = "crates/cli" }
