@@ -12,11 +12,12 @@ use tokio::sync::RwLock;
 use tracing::warn;
 
 use crate::config::AppConfig;
+use crate::ipc::IpcServer;
 
 pub async fn handle_daemon(port_opt: Option<u16>, rendezvous_url_opt: Option<String>) -> Result<()> {
     let config = AppConfig::load_or_default();
     let port = port_opt.unwrap_or(config.port);
-    let rendezvous_url = rendezvous_url_opt.unwrap_or(config.rendezvous_url);
+    let rendezvous_url = rendezvous_url_opt.unwrap_or(config.rendezvous_url.clone());
     let config_dir = AppConfig::config_dir()?;
 
     println!("============================================================");
@@ -44,7 +45,7 @@ pub async fn handle_daemon(port_opt: Option<u16>, rendezvous_url_opt: Option<Str
         None
     };
 
-    // 3. Mở BlockStore
+    // 3. Mở BlockStore độc quyền duy nhất bởi Daemon
     let blockstore_path = config_dir.join("blockstore");
     let blockstore = BlockStore::open(&blockstore_path)
         .context("Không thể mở BlockStore trên đĩa")?;
@@ -71,22 +72,19 @@ pub async fn handle_daemon(port_opt: Option<u16>, rendezvous_url_opt: Option<Str
 
     let listen_multiaddr: Multiaddr = format!("/ip4/0.0.0.0/tcp/{}", port).parse()?;
     service.listen_on(listen_multiaddr.clone()).await?;
-    println!("👂 Đang lắng nghe P2P tại: \x1b[1;36m{}\x1b[0m", listen_multiaddr);
+    println!("👂 P2P Network: Đang lắng nghe tại \x1b[1;36m{}\x1b[0m", listen_multiaddr);
 
     // 6. Rendezvous Bootstrap & Heartbeat
     let rendezvous = RendezvousClient::new(&rendezvous_url);
-    println!("📡 Kết nối Rendezvous Server: \x1b[1;34m{}\x1b[0m", rendezvous_url);
+    println!("📡 Rendezvous Server: \x1b[1;34m{}\x1b[0m", rendezvous_url);
 
     let public_multiaddr: Multiaddr = format!("/ip4/127.0.0.1/tcp/{}/p2p/{}", port, service.local_peer_id()).parse()?;
-    
-    // Khởi chạy Heartbeat background loop (10 phút/lần)
     let _heartbeat_handle = rendezvous.start_heartbeat_loop(
         service.local_peer_id(),
         public_multiaddr,
         Some("VN".to_string()),
     );
 
-    // Bootstrap peers ban đầu
     match service.bootstrap_from_rendezvous(&rendezvous, 20).await {
         Ok(count) => {
             println!("🌐 Bootstrap: Đã liên kết với \x1b[1;32m{}\x1b[0m peers từ mạng lưới", count);
@@ -97,11 +95,28 @@ pub async fn handle_daemon(port_opt: Option<u16>, rendezvous_url_opt: Option<Str
         }
     }
 
+    // 7. Khởi động Local IPC Server cho Thin CLI Clients
+    let ipc_server = Arc::new(IpcServer::new(
+        service.clone(),
+        identity.clone(),
+        swarm_key.clone(),
+        blockstore.clone(),
+        quota_manager.clone(),
+        config.clone(),
+    ));
+
+    tokio::spawn(async move {
+        if let Err(e) = ipc_server.run().await {
+            eprintln!("❌ Lỗi IPC Server: {}", e);
+        }
+    });
+
+    println!("🔌 Local IPC Server: Đã mở socket tại \x1b[1;32m127.0.0.1:5001\x1b[0m (sẵn sàng nhận lệnh upload/download/status)");
     println!("============================================================");
     println!("✨ Node P2P đang hoạt động ổn định. Nhấn \x1b[1;31mCtrl+C\x1b[0m để dừng an toàn.");
     println!("============================================================");
 
-    // 7. Lắng nghe tín hiệu dừng Ctrl+C / SIGINT
+    // 8. Lắng nghe tín hiệu dừng Ctrl+C / SIGINT
     signal::ctrl_c().await.context("Lỗi lắng nghe tín hiệu Ctrl+C")?;
 
     println!("\n🛑 Đang tiến hành tắt an toàn (Graceful Shutdown)...");

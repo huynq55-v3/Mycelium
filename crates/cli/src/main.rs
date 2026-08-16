@@ -1,5 +1,6 @@
 mod commands;
 mod config;
+mod ipc;
 mod manifest;
 
 use std::path::PathBuf;
@@ -16,8 +17,8 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
     version = "0.1.0",
     about = "Hệ thống lưu trữ đám mây phân tán P2P bảo mật bằng Reed-Solomon Erasure Coding & AES-256-GCM",
     long_about = "Mycelium P2P Drive cho phép người dùng lưu trữ dữ liệu an toàn trên mạng lưới phân tán ngang hàng.\n\
-                  Mỗi tệp tin được mã hóa AES-256-GCM và phân rã thành 10 Data Shards + 30 Parity Shards (Tổng 40 Shards).\n\
-                  Chỉ cần 10 shards bất kỳ còn sống là khôi phục 100% dữ liệu gốc."
+                  Kiến trúc Client-Daemon qua Local IPC: Daemon quản lý duy nhất BlockStore & Swarm,\n\
+                  CLI đóng vai trò Thin Client thực thi các tác vụ upload, download, status."
 )]
 struct Cli {
     /// Bật chế độ verbose logging (debug)
@@ -45,7 +46,7 @@ enum Commands {
         rendezvous_url: Option<String>,
     },
 
-    /// Khởi chạy tiến trình P2P Node chạy nền (Daemon) kết nối vào mạng lưới
+    /// [SERVER MODE] Khởi chạy tiến trình P2P Node chạy nền (Daemon & Local IPC Server)
     Daemon {
         /// Cổng TCP lắng nghe kết nối P2P (mặc định 4001)
         #[arg(short, long)]
@@ -56,14 +57,14 @@ enum Commands {
         rendezvous_url: Option<String>,
     },
 
-    /// Mã hóa và phân tán tệp tin lên mạng lưới P2P
+    /// [CLIENT MODE] Mã hóa và phân tán tệp tin lên mạng lưới P2P thông qua Daemon
     Upload {
         /// Đường dẫn tệp tin cần tải lên
         #[arg(value_name = "FILE_PATH")]
         file_path: PathBuf,
     },
 
-    /// Tải về và tái tạo tệp tin từ file manifest thông qua mạng P2P
+    /// [CLIENT MODE] Tải về và tái tạo tệp tin từ file manifest thông qua Daemon
     Download {
         /// Đường dẫn tới file manifest (*.manifest.json)
         #[arg(value_name = "MANIFEST_PATH")]
@@ -74,7 +75,7 @@ enum Commands {
         output: PathBuf,
     },
 
-    /// Hiển thị thông tin trạng thái hoạt động của node, hạn ngạch và dung lượng
+    /// [CLIENT MODE] Hiển thị thông tin trạng thái hoạt động của daemon, hạn ngạch và dung lượng
     Status,
 }
 
