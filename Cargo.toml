@@ -38,6 +38,11 @@ dirs = "6.0"
 # Erasure Coding
 reed-solomon-erasure = "6.0"
 
+# Embedded Key-Value Storage
+sled = "0.34"
+
 # Internal Crates
 core-crypto = { path = "crates/core-crypto" }
 erasure-codec = { path = "crates/erasure-codec" }
+blockstore = { path = "crates/blockstore" }
+quota-manager = { path = "crates/quota-manager" }
