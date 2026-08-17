@@ -74,6 +74,7 @@ impl P2PService {
         swarm_key: Option<&SwarmKey>,
         blockstore: BlockStore,
         quota_manager: Arc<RwLock<QuotaManager>>,
+        is_relay: bool,
     ) -> Result<(Self, tokio::task::JoinHandle<()>), NetworkError> {
         let secret_bytes = identity.secret_key_bytes();
         let libp2p_secret = libp2p::identity::ed25519::SecretKey::try_from_bytes(secret_bytes)
@@ -82,7 +83,7 @@ impl P2PService {
         let local_peer_id = keypair.public().to_peer_id();
 
         let transport = build_transport(&keypair, swarm_key)?;
-        let behaviour = MyceliumBehaviour::new(&keypair)
+        let behaviour = MyceliumBehaviour::new(&keypair, is_relay)
             .map_err(|e| NetworkError::TransportError(format!("Lỗi khởi tạo Behaviour: {e}")))?;
 
         let swarm = Swarm::new(

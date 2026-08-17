@@ -16,7 +16,7 @@ async fn test_p2p_service_initialization_and_listener() {
     let quota_manager = Arc::new(RwLock::new(QuotaManager::default_60gb()));
 
     let (service, _handle) =
-        P2PService::new(&identity, Some(&swarm_key), blockstore, quota_manager)
+        P2PService::new(&identity, Some(&swarm_key), blockstore, quota_manager, false)
             .expect("Khởi tạo P2PService thành công");
 
     let listen_addr: libp2p::Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
@@ -44,7 +44,7 @@ async fn test_two_nodes_p2p_direct_shard_transfer() {
     let identity1 = Identity::generate();
     let store1 = BlockStore::open_temporary().unwrap();
     let quota1 = Arc::new(RwLock::new(QuotaManager::default_60gb()));
-    let (node1, _h1) = P2PService::new(&identity1, Some(&swarm_key), store1.clone(), quota1)
+    let (node1, _h1) = P2PService::new(&identity1, Some(&swarm_key), store1.clone(), quota1, false)
         .expect("Tạo Node 1");
 
     // Lắng nghe trên cổng ngẫu nhiên 127.0.0.1
@@ -55,7 +55,6 @@ async fn test_two_nodes_p2p_direct_shard_transfer() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     let listeners1 = node1.get_listeners().await.unwrap();
     if listeners1.is_empty() {
-        // Trong trường hợp listener chưa sẵn sàng, dùng thử cổng cố định
         return;
     }
 
@@ -65,7 +64,7 @@ async fn test_two_nodes_p2p_direct_shard_transfer() {
     let identity2 = Identity::generate();
     let store2 = BlockStore::open_temporary().unwrap();
     let quota2 = Arc::new(RwLock::new(QuotaManager::default_60gb()));
-    let (node2, _h2) = P2PService::new(&identity2, Some(&swarm_key), store2.clone(), quota2)
+    let (node2, _h2) = P2PService::new(&identity2, Some(&swarm_key), store2.clone(), quota2, false)
         .expect("Tạo Node 2");
 
     // Node 2 Dial tới Node 1

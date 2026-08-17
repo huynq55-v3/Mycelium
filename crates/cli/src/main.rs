@@ -56,9 +56,13 @@ enum Commands {
         #[arg(short, long)]
         rendezvous_url: Option<String>,
 
-        /// Địa chỉ IP công cộng tĩnh (nếu cấu hình Port-Forwarding/VPS)
+        /// Địa chỉ IP công cộng tĩnh (nếu cấu hình Port-Forwarding/VPS/ngrok)
         #[arg(long)]
         public_ip: Option<String>,
+
+        /// Bật tính năng Circuit Relay v2 Server (làm trạm trung chuyển vượt NAT cho mạng lưới)
+        #[arg(long)]
+        relay: bool,
     },
 
     /// [CLIENT MODE] Mã hóa và phân tán tệp tin lên mạng lưới P2P thông qua Daemon
@@ -111,8 +115,9 @@ async fn main() -> Result<()> {
             port,
             rendezvous_url,
             public_ip,
+            relay,
         } => {
-            commands::daemon::handle_daemon(port, rendezvous_url, public_ip).await?;
+            commands::daemon::handle_daemon(port, rendezvous_url, public_ip, relay).await?;
         }
         Commands::Upload { file_path } => {
             commands::upload::handle_upload(file_path).await?;

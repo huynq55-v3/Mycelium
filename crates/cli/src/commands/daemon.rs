@@ -23,7 +23,7 @@ async fn detect_public_or_lan_ip() -> String {
         .unwrap_or_else(|_| reqwest::Client::new());
 
     let ip_services = [
-        "https://api64.ipify.org", // Tự trả về IPv6 nếu mạng hỗ trợ, hoặc IPv4
+        "https://api64.ipify.org",
         "https://api.ipify.org",
         "https://ifconfig.me/ip",
         "https://icanhazip.com",
@@ -47,6 +47,7 @@ pub async fn handle_daemon(
     port_opt: Option<u16>,
     rendezvous_url_opt: Option<String>,
     public_ip_opt: Option<String>,
+    is_relay: bool,
 ) -> Result<()> {
     let config = AppConfig::load_or_default();
     let port = port_opt.unwrap_or(config.port);
@@ -55,6 +56,9 @@ pub async fn handle_daemon(
 
     println!("============================================================");
     println!("       🚀 KHỞI ĐỘNG MYCELIUM P2P STORAGE DAEMON 🚀           ");
+    if is_relay {
+        println!("  🌟 CHẾ ĐỘ: CIRCUIT RELAY V2 SERVER (TRẠM TRUNG CHUYỂN NAT) 🌟");
+    }
     println!("============================================================");
 
     // 1. Nạp Identity
@@ -95,12 +99,13 @@ pub async fn handle_daemon(
     };
     let quota_manager = Arc::new(RwLock::new(quota));
 
-    // 5. Khởi động P2PService
+    // 5. Khởi động P2PService với cấu hình Relay Server nếu được yêu cầu
     let (service, _service_handle) = P2PService::new(
         &identity,
         swarm_key.as_ref(),
         blockstore.clone(),
         quota_manager.clone(),
+        is_relay,
     ).context("Khởi tạo P2PService thất bại")?;
 
     // Lắng nghe Dual-Stack: IPv4

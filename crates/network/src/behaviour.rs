@@ -1,10 +1,13 @@
 use std::time::Duration;
 
+use libp2p::autonat::{self, Config as AutoNatConfig};
+use libp2p::dcutr;
 use libp2p::identify::{self, Config as IdentifyConfig};
 use libp2p::identity::Keypair;
 use libp2p::kad::store::MemoryStore;
 use libp2p::kad::{self, Config as KadConfig};
 use libp2p::mdns::{self, Config as MdnsConfig};
+use libp2p::relay;
 use libp2p::request_response::cbor::Behaviour as CborReqResp;
 use libp2p::request_response::{Config as ReqRespConfig, ProtocolSupport};
 use libp2p::swarm::NetworkBehaviour;
@@ -19,6 +22,7 @@ pub const MYCELIUM_KAD_PROTOCOL: StreamProtocol =
 pub const MYCELIUM_AGENT_VERSION: &str = "mycelium/p2p-drive/0.1.0";
 
 /// Tập hợp các hành vi mạng (Network Behaviour) của node Mycelium P2P.
+/// Tích hợp đầy đủ Circuit Relay v2 Server, DCUtR Hole-Punching và AutoNAT.
 #[derive(NetworkBehaviour)]
 pub struct MyceliumBehaviour {
     /// Định tuyến phân tán Kademlia DHT để tìm kiếm node và công bố provider records.
@@ -29,11 +33,17 @@ pub struct MyceliumBehaviour {
     pub request_response: CborReqResp<ShardRequest, ShardResponse>,
     /// Xác thực danh tính và thông tin của peer kết nối.
     pub identify: identify::Behaviour,
+    /// Circuit Relay v2 Server (cho phép node làm trạm trung chuyển vượt NAT cho mạng lưới).
+    pub relay_server: relay::Behaviour,
+    /// Direct Connection Upgrade through Relay (Tự động đục lỗ NAT 2 chiều qua Relay).
+    pub dcutr: dcutr::Behaviour,
+    /// Tự động phát hiện trạng thái NAT (Public hay Private).
+    pub autonat: autonat::Behaviour,
 }
 
 impl MyceliumBehaviour {
     /// Khởi tạo `MyceliumBehaviour` với cấu hình tối ưu cho mạng P2P Drive.
-    pub fn new(local_key: &Keypair) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn new(local_key: &Keypair, is_relay: bool) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let local_peer_id = local_key.public().to_peer_id();
 
         // 1. Cấu hình Kademlia DHT
@@ -59,11 +69,37 @@ impl MyceliumBehaviour {
         .with_agent_version(MYCELIUM_AGENT_VERSION.to_string());
         let identify = identify::Behaviour::new(identify_config);
 
+        // 5. Cấu hình Circuit Relay v2 Server
+        let relay_config = if is_relay {
+            relay::Config {
+                max_reservations: 128,
+                max_circuits: 256,
+                max_circuit_duration: Duration::from_secs(120),
+                max_circuit_bytes: 1024 * 1024 * 100, // 100 MB
+                ..Default::default()
+            }
+        } else {
+            relay::Config::default()
+        };
+        let relay_server = relay::Behaviour::new(local_peer_id, relay_config);
+
+        // 6. Cấu hình DCUtR Hole-Punching
+        let dcutr = dcutr::Behaviour::new(local_peer_id);
+
+        // 7. Cấu hình AutoNAT
+        let autonat = autonat::Behaviour::new(
+            local_peer_id,
+            AutoNatConfig::default(),
+        );
+
         Ok(Self {
             kademlia,
             mdns,
             request_response,
             identify,
+            relay_server,
+            dcutr,
+            autonat,
         })
     }
 }
