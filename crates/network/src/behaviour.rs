@@ -1,7 +1,6 @@
 use std::time::Duration;
 
 use libp2p::autonat::{self, Config as AutoNatConfig};
-use libp2p::dcutr;
 use libp2p::identify::{self, Config as IdentifyConfig};
 use libp2p::identity::Keypair;
 use libp2p::kad::store::MemoryStore;
@@ -20,9 +19,11 @@ pub const MYCELIUM_STORAGE_PROTOCOL: StreamProtocol =
 pub const MYCELIUM_KAD_PROTOCOL: StreamProtocol =
     StreamProtocol::new("/mycelium/kad/1.0.0");
 pub const MYCELIUM_AGENT_VERSION: &str = "mycelium/p2p-drive/0.1.0";
+pub const MYCELIUM_RELAY_PROTOCOL: &str = "/mycelium/relay/1.0.0";
+pub const MYCELIUM_RELAY_AGENT_VERSION: &str = "mycelium-relay/0.1.0";
 
 /// Tập hợp các hành vi mạng (Network Behaviour) của node Mycelium P2P.
-/// Tích hợp đầy đủ Circuit Relay v2 Client, DCUtR Hole-Punching, AutoNAT và Kademlia DHT.
+/// Tích hợp đầy đủ Circuit Relay v2 Client, AutoNAT, Kademlia DHT và mô hình kết nối On-Demand.
 #[derive(NetworkBehaviour)]
 pub struct MyceliumBehaviour {
     /// Định tuyến phân tán Kademlia DHT để tìm kiếm node và công bố provider records.
@@ -33,10 +34,8 @@ pub struct MyceliumBehaviour {
     pub request_response: CborReqResp<ShardRequest, ShardResponse>,
     /// Xác thực danh tính và thông tin của peer kết nối.
     pub identify: identify::Behaviour,
-    /// Circuit Relay v2 Client (cho phép node đăng ký và chuyển tiếp qua Relay khi bị NAT chặn).
+    /// Circuit Relay v2 Client (cho phép node đăng ký và chuyển tiếp qua Relay).
     pub relay_client: relay::client::Behaviour,
-    /// Direct Connection Upgrade through Relay (Tự động đục lỗ NAT 2 chiều qua Relay).
-    pub dcutr: dcutr::Behaviour,
     /// Tự động phát hiện trạng thái NAT (Public hay Private).
     pub autonat: autonat::Behaviour,
 }
@@ -72,10 +71,7 @@ impl MyceliumBehaviour {
         .with_agent_version(MYCELIUM_AGENT_VERSION.to_string());
         let identify = identify::Behaviour::new(identify_config);
 
-        // 5. Cấu hình DCUtR Hole-Punching
-        let dcutr = dcutr::Behaviour::new(local_peer_id);
-
-        // 6. Cấu hình AutoNAT
+        // 5. Cấu hình AutoNAT
         let autonat = autonat::Behaviour::new(
             local_peer_id,
             AutoNatConfig::default(),
@@ -87,7 +83,6 @@ impl MyceliumBehaviour {
             request_response,
             identify,
             relay_client,
-            dcutr,
             autonat,
         })
     }

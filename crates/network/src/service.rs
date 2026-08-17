@@ -53,6 +53,9 @@ enum P2PCommand {
     GetConnectedPeers {
         respond_to: oneshot::Sender<Vec<PeerId>>,
     },
+    GetKnownPeers {
+        respond_to: oneshot::Sender<Vec<PeerId>>,
+    },
     GetListeners {
         respond_to: oneshot::Sender<Vec<Multiaddr>>,
     },
@@ -91,11 +94,13 @@ impl P2PService {
         let behaviour = MyceliumBehaviour::new(&keypair, relay_client)
             .map_err(|e| NetworkError::TransportError(format!("Lỗi khởi tạo Behaviour: {e}")))?;
 
+        // Chế độ On-Demand: Đóng kết nối nhàn rỗi sau 30 giây khi không còn tác vụ truyền file
         let swarm = Swarm::new(
             transport,
             behaviour,
             local_peer_id,
-            libp2p::swarm::Config::with_tokio_executor(),
+            libp2p::swarm::Config::with_tokio_executor()
+                .with_idle_connection_timeout(Duration::from_secs(30)),
         );
 
         let (command_tx, command_rx) = mpsc::channel(100);
@@ -252,6 +257,15 @@ impl P2PService {
         rx.await.map_err(|e| NetworkError::ChannelClosed(e.to_string()))
     }
 
+    pub async fn get_known_peers(&self) -> Result<Vec<PeerId>, NetworkError> {
+        let (tx, rx) = oneshot::channel();
+        self.command_tx
+            .send(P2PCommand::GetKnownPeers { respond_to: tx })
+            .await
+            .map_err(|e| NetworkError::ChannelClosed(e.to_string()))?;
+        rx.await.map_err(|e| NetworkError::ChannelClosed(e.to_string()))
+    }
+
     pub async fn get_listeners(&self) -> Result<Vec<Multiaddr>, NetworkError> {
         let (tx, rx) = oneshot::channel();
         self.command_tx
@@ -315,15 +329,54 @@ impl P2PEventLoop {
 
     async fn run(&mut self) {
         info!("Bắt đầu P2P Event Loop cho node {}", self.local_peer_id);
+        let mut rebalance_interval = tokio::time::interval(Duration::from_secs(15));
+        rebalance_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             tokio::select! {
+                _ = rebalance_interval.tick() => {
+                    self.perform_mesh_rebalance().await;
+                }
                 Some(cmd) = self.command_rx.recv() => {
                     self.handle_command(cmd).await;
                 }
                 event = self.swarm.select_next_some() => {
                     self.handle_swarm_event(event).await;
                 }
+            }
+        }
+    }
+
+    async fn perform_mesh_rebalance(&mut self) {
+        let storage_peers: Vec<PeerId> = self
+            .connected_peers
+            .iter()
+            .cloned()
+            .filter(|p| !self.reserved_relays.contains(p) && !self.discovered_relays.contains(p))
+            .collect();
+
+        if storage_peers.is_empty() {
+            return;
+        }
+
+        let shard_hashes = match self.blockstore.list_shard_hashes() {
+            Ok(hashes) if !hashes.is_empty() => hashes,
+            _ => return,
+        };
+
+        // Phân tán các shards hiện có sang các storage peers làm Cache (tối đa 20 shards/peer)
+        let shards_per_peer = (shard_hashes.len() / storage_peers.len().max(1)).clamp(1, 20);
+        let sample_count = (storage_peers.len() * shards_per_peer).min(shard_hashes.len());
+        info!("🔄 [Mesh Diffusion] Đang tự động chia sẻ {} shard cache (tối đa {}/peer) sang {} storage peer(s)...", sample_count, shards_per_peer, storage_peers.len());
+        for i in 0..sample_count {
+            let hash = &shard_hashes[i % shard_hashes.len()];
+            if let Ok(Some(data)) = self.blockstore.get_shard(hash) {
+                let target_peer = storage_peers[i % storage_peers.len()];
+                let req = ShardRequest::Push(crate::protocol::PushShard {
+                    hash: hash.clone(),
+                    data,
+                });
+                let _ = self.swarm.behaviour_mut().request_response.send_request(&target_peer, req);
             }
         }
     }
@@ -373,68 +426,87 @@ impl P2PEventLoop {
                             continue;
                         }
 
-                        let addr_str = addr.to_string();
-                        let is_relay_server = (addr_str.contains("ngrok")
-                            || addr_str.contains("relay")
-                            || addr_str.contains("/dns")
-                            || addr_str.contains("/tcp/4002"))
+                        let addr_str = addr.to_string().to_lowercase();
+                        let is_relay_server = addr_str.contains("relay")
                             && !addr_str.contains("/p2p-circuit/");
 
                         if is_relay_server {
                             self.discovered_relays.insert(peer_id);
                             let relay_with_id = ensure_relay_peer_id(addr.clone(), &peer_id);
-                            self.known_relays.insert(relay_with_id);
+                            self.known_relays.insert(relay_with_id.clone());
                             info!("🔎 Phát hiện Relay Server trong mạng: {} ({})", peer_id, addr);
-                        }
 
-                        self.known_peer_addrs
-                            .entry(peer_id)
-                            .or_default()
-                            .insert(addr.clone());
+                            self.known_peer_addrs
+                                .entry(peer_id)
+                                .or_default()
+                                .insert(addr.clone());
 
-                        self.swarm
-                            .behaviour_mut()
-                            .kademlia
-                            .add_address(&peer_id, addr.clone());
+                            self.swarm
+                                .behaviour_mut()
+                                .kademlia
+                                .add_address(&peer_id, addr.clone());
 
-                        // Ghi nhận địa chỉ vào Kademlia và bảng địa chỉ
-                        if !is_relay_server {
-                            for relay_addr in &self.known_relays {
-                                if let Some(relay_id) = extract_peer_id(relay_addr) {
-                                    let relay_with_id = ensure_relay_peer_id(relay_addr.clone(), &relay_id);
-                                    let circuit_addr = relay_with_id
-                                        .with(libp2p::multiaddr::Protocol::P2pCircuit)
-                                        .with(libp2p::multiaddr::Protocol::P2p(peer_id));
+                            // Chủ động dial trực tiếp tới Relay Server
+                            if !self.connected_peers.contains(&peer_id) {
+                                info!("🔄 Đang quay số kết nối tới Relay: {} ({})", peer_id, addr);
+                                let _ = self.swarm.dial(addr.clone());
+                            }
 
-                                    self.known_peer_addrs
-                                        .entry(peer_id)
-                                        .or_default()
-                                        .insert(circuit_addr.clone());
-
-                                    self.swarm
-                                        .behaviour_mut()
-                                        .kademlia
-                                        .add_address(&peer_id, circuit_addr);
+                            // Đăng ký Relay Reservation
+                            if !self.reserved_relays.contains(&peer_id) {
+                                let circuit_addr = relay_with_id.with(libp2p::multiaddr::Protocol::P2pCircuit);
+                                info!("🔗 Đang gửi yêu cầu Relay Circuit Reservation tại: {}", circuit_addr);
+                                match self.swarm.listen_on(circuit_addr) {
+                                    Ok(_) => {
+                                        self.reserved_relays.insert(peer_id);
+                                    }
+                                    Err(e) => {
+                                        warn!("❌ Lỗi đăng ký circuit_addr trên {}: {}", peer_id, e);
+                                    }
                                 }
                             }
-                        }
+                        } else {
+                            // Đây là Storage Peer: Lưu địa chỉ vào danh bạ (dùng để tổng hợp) nhưng KHÔNG dial trực tiếp qua NAT Router.
+                            self.known_peer_addrs
+                                .entry(peer_id)
+                                .or_default()
+                                .insert(addr.clone());
 
-                        // Nếu chưa kết nối tới peer này, chủ động dial (chỉ dial direct ban đầu; circuit dial sẽ kích hoạt khi Relay cấp phép Reservation)
-                        if !self.connected_peers.contains(&peer_id) && !addr_str.contains("/p2p-circuit/") {
-                            if is_relay_server {
-                                info!("🔄 Đang quay số kết nối tới Relay: {} ({})", peer_id, addr);
+                            self.swarm
+                                .behaviour_mut()
+                                .kademlia
+                                .add_address(&peer_id, addr.clone());
+
+                            if addr_str.contains("/p2p-circuit/") {
+                                if !self.connected_peers.contains(&peer_id) {
+                                    info!("⚡ Nối cầu Circuit từ Rendezvous tới Storage Peer: {} ({})", peer_id, addr);
+                                    let _ = self.swarm.dial(addr.clone());
+                                }
                             } else {
-                                info!("🔄 Đang quay số kết nối tới Peer: {} ({})", peer_id, addr);
-                            }
-                            let _ = self.swarm.dial(addr.clone());
-                        }
+                                // Ghép với Relay hiện có (nếu có) để tạo Circuit Address
+                                for relay_addr in &self.known_relays {
+                                    if let Some(relay_id) = extract_peer_id(relay_addr) {
+                                        let relay_with_id = ensure_relay_peer_id(relay_addr.clone(), &relay_id);
+                                        let circuit_addr = relay_with_id
+                                            .with(libp2p::multiaddr::Protocol::P2pCircuit)
+                                            .with(libp2p::multiaddr::Protocol::P2p(peer_id));
 
-                        if is_relay_server && !self.reserved_relays.contains(&peer_id) {
-                            let relay_with_id = ensure_relay_peer_id(addr.clone(), &peer_id);
-                            let circuit_addr = relay_with_id.with(libp2p::multiaddr::Protocol::P2pCircuit);
-                            info!("🔗 Đang gửi yêu cầu Relay Circuit Reservation tại: {}", circuit_addr);
-                            if let Ok(_) = self.swarm.listen_on(circuit_addr) {
-                                self.reserved_relays.insert(peer_id);
+                                        self.known_peer_addrs
+                                            .entry(peer_id)
+                                            .or_default()
+                                            .insert(circuit_addr.clone());
+
+                                        self.swarm
+                                            .behaviour_mut()
+                                            .kademlia
+                                            .add_address(&peer_id, circuit_addr.clone());
+
+                                        if !self.connected_peers.contains(&peer_id) {
+                                            info!("⚡ Nối cầu Circuit tới Storage Peer: {} ({})", peer_id, circuit_addr);
+                                            let _ = self.swarm.dial(circuit_addr);
+                                        }
+                                    }
+                                }
                             }
                         }
 
@@ -446,28 +518,41 @@ impl P2PEventLoop {
                 let _ = respond_to.send(Ok(added));
             }
             P2PCommand::DistributeShards { shards, respond_to } => {
-                let connected: Vec<PeerId> = self.connected_peers.iter().cloned().collect();
-                if connected.is_empty() {
-                    for shard in &shards {
-                        let _ = self.blockstore.put_shard(&shard.hash, &shard.data);
-                        let key = RecordKey::new(&shard.hash.as_bytes());
-                        let _ = self.swarm.behaviour_mut().kademlia.start_providing(key);
-                    }
-                    let _ = respond_to.send(Ok(()));
-                    return;
+                // 1. Luôn lưu toàn bộ shards vào BlockStore cục bộ của chính uploader và công bố lên DHT
+                for shard in &shards {
+                    let _ = self.blockstore.put_shard(&shard.hash, &shard.data);
+                    let key = RecordKey::new(&shard.hash.as_bytes());
+                    let _ = self.swarm.behaviour_mut().kademlia.start_providing(key);
                 }
 
-                let total_peers = connected.len();
-                for (i, shard) in shards.into_iter().enumerate() {
-                    let target_peer = connected[i % total_peers];
-                    let req = ShardRequest::Push(PushShard {
-                        hash: shard.hash.clone(),
-                        data: shard.data,
-                    });
-                    self.swarm
-                        .behaviour_mut()
-                        .request_response
-                        .send_request(&target_peer, req);
+                // 2. Lọc danh sách storage peers đang kết nối (loại trừ Relay nếu có nhiều peer)
+                let storage_peers: Vec<PeerId> = self
+                    .connected_peers
+                    .iter()
+                    .cloned()
+                    .filter(|p| !self.reserved_relays.contains(p) && !self.discovered_relays.contains(p))
+                    .collect();
+
+                let target_peers = if storage_peers.is_empty() {
+                    self.connected_peers.iter().cloned().collect()
+                } else {
+                    storage_peers
+                };
+
+                // 3. Phân tán các bản sao Shards sang các peers
+                if !target_peers.is_empty() {
+                    let total_peers = target_peers.len();
+                    for (i, shard) in shards.into_iter().enumerate() {
+                        let target_peer = target_peers[i % total_peers];
+                        let req = ShardRequest::Push(PushShard {
+                            hash: shard.hash.clone(),
+                            data: shard.data,
+                        });
+                        self.swarm
+                            .behaviour_mut()
+                            .request_response
+                            .send_request(&target_peer, req);
+                    }
                 }
 
                 let _ = respond_to.send(Ok(()));
@@ -499,12 +584,14 @@ impl P2PEventLoop {
                     return;
                 }
 
-                // Thử re-dial các known peers chưa kết nối (cả direct và qua Relay Circuit)
+                // Thử re-dial các known peers chưa kết nối (chỉ qua Relay Circuit cho Storage Peer)
                 for (peer_id, addrs) in &self.known_peer_addrs {
                     if !self.connected_peers.contains(peer_id) {
+                        let is_relay = self.discovered_relays.contains(peer_id);
                         for addr in addrs {
-                            if is_dialable_multiaddr(addr) {
-                                info!("🔄 Đang thử kết nối lại tới known peer {} ({})", peer_id, addr);
+                            let s = addr.to_string();
+                            if (is_relay || s.contains("/p2p-circuit/")) && is_dialable_multiaddr(addr) {
+                                info!("🔄 Đang thử kết nối lại tới peer {} qua Relay ({})", peer_id, addr);
                                 let _ = self.swarm.dial(addr.clone());
                             }
                         }
@@ -560,6 +647,13 @@ impl P2PEventLoop {
                 let peers: Vec<PeerId> = self.connected_peers.iter().cloned().collect();
                 let _ = respond_to.send(peers);
             }
+            P2PCommand::GetKnownPeers { respond_to } => {
+                let peers: Vec<PeerId> = self.known_peer_addrs.keys()
+                    .filter(|p| !self.reserved_relays.contains(p) && !self.discovered_relays.contains(p))
+                    .cloned()
+                    .collect();
+                let _ = respond_to.send(peers);
+            }
             P2PCommand::GetListeners { respond_to } => {
                 let listeners: Vec<Multiaddr> = self.swarm.listeners().cloned().collect();
                 let _ = respond_to.send(listeners);
@@ -570,53 +664,55 @@ impl P2PEventLoop {
     async fn handle_swarm_event(&mut self, event: SwarmEvent<MyceliumBehaviourEvent>) {
         match event {
             SwarmEvent::ConnectionEstablished {
-                peer_id, endpoint, ..
+                peer_id,
+                endpoint,
+                num_established,
+                ..
             } => {
-                info!("🎉 Đã thiết lập kết nối 2 chiều thành công với peer: {}", peer_id);
+                if num_established.get() == 1 {
+                    info!("🎉 Đã thiết lập kết nối 2 chiều thành công với peer: {}", peer_id);
+                } else {
+                    debug!("🔗 Mở thêm luồng kết nối phụ (#{}) tới peer: {}", num_established, peer_id);
+                }
                 self.connected_peers.insert(peer_id);
-                let remote_addr = match &endpoint {
-                    ConnectedPoint::Dialer { address, .. } => address.clone(),
-                    ConnectedPoint::Listener { send_back_addr, .. } => send_back_addr.clone(),
-                };
-                if is_dialable_multiaddr(&remote_addr) {
-                    self.swarm
-                        .behaviour_mut()
-                        .kademlia
-                        .add_address(&peer_id, remote_addr.clone());
-                    self.known_peer_addrs
-                        .entry(peer_id)
-                        .or_default()
-                        .insert(remote_addr.clone());
+                // Chỉ ghi nhận địa chỉ khi WE là bên chủ động Dial (vì đó là cổng lắng nghe thực của peer).
+                // Khi là Listener (Inbound), send_back_addr là ephemeral source port ngẫu nhiên của socket OS, không phải cổng lắng nghe.
+                if let ConnectedPoint::Dialer { address, .. } = &endpoint {
+                    if is_dialable_multiaddr(address) {
+                        self.swarm
+                            .behaviour_mut()
+                            .kademlia
+                            .add_address(&peer_id, address.clone());
+                        self.known_peer_addrs
+                            .entry(peer_id)
+                            .or_default()
+                            .insert(address.clone());
+                    }
                 }
 
                 // Khi đã kết nối thành công tới peer, nếu peer này là Relay và chưa tạo reservation:
-                let addr_str = remote_addr.to_string();
-                let is_potential_relay = self.discovered_relays.contains(&peer_id)
-                    || addr_str.contains("ngrok")
-                    || addr_str.contains("relay")
-                    || addr_str.contains("/dns")
-                    || addr_str.contains("/tcp/4002");
+                let is_potential_relay = self.discovered_relays.contains(&peer_id);
 
                 if is_potential_relay {
-                    let relay_addr_base = if let Some(addrs) = self.known_peer_addrs.get(&peer_id) {
-                        addrs.iter().find(|a| !a.to_string().contains("/p2p-circuit/")).cloned().unwrap_or_else(|| remote_addr.clone())
-                    } else {
-                        remote_addr.clone()
-                    };
-                    let relay_with_id = ensure_relay_peer_id(relay_addr_base, &peer_id);
-                    self.known_relays.insert(relay_with_id.clone());
+                    let relay_addr_base = self.known_peer_addrs.get(&peer_id)
+                        .and_then(|addrs| addrs.iter().find(|a| !a.to_string().contains("/p2p-circuit")).cloned());
 
-                    if !self.reserved_relays.contains(&peer_id) {
-                        let circuit_addr = relay_with_id.clone().with(libp2p::multiaddr::Protocol::P2pCircuit);
-                        info!("🔗 Đang đăng ký Relay Circuit Reservation tại: {}", circuit_addr);
-                        if let Err(e) = self.swarm.listen_on(circuit_addr) {
-                            warn!("❌ Lỗi đăng ký circuit_addr trên {}: {}", peer_id, e);
-                        }
+                    if let Some(base_addr) = relay_addr_base {
+                        let relay_with_id = ensure_relay_peer_id(base_addr, &peer_id);
+                        self.known_relays.insert(relay_with_id.clone());
 
-                        if let Ok(p2p_only) = format!("/p2p/{}/p2p-circuit", peer_id).parse::<Multiaddr>() {
-                            let _ = self.swarm.listen_on(p2p_only);
+                        if !self.reserved_relays.contains(&peer_id) {
+                            let circuit_addr = relay_with_id.with(libp2p::multiaddr::Protocol::P2pCircuit);
+                            info!("🔗 Đang đăng ký Relay Circuit Reservation tại: {}", circuit_addr);
+                            match self.swarm.listen_on(circuit_addr) {
+                                Ok(_) => {
+                                    self.reserved_relays.insert(peer_id);
+                                }
+                                Err(e) => {
+                                    warn!("❌ Lỗi đăng ký circuit_addr trên {}: {}", peer_id, e);
+                                }
+                            }
                         }
-                        self.reserved_relays.insert(peer_id);
                     }
                 }
             }
@@ -666,18 +762,9 @@ impl P2PEventLoop {
             SwarmEvent::Behaviour(MyceliumBehaviourEvent::Identify(identify_event)) => {
                 if let libp2p::identify::Event::Received { peer_id, info, .. } = identify_event {
                     trace!("Nhận thông tin Identify từ {}: {:?}", peer_id, info.listen_addrs);
-                    if info.protocol_version.contains("relay") || info.agent_version.contains("relay") {
-                        self.discovered_relays.insert(peer_id);
-                        if !self.reserved_relays.contains(&peer_id) {
-                            if let Ok(p2p_only) = format!("/p2p/{}/p2p-circuit", peer_id).parse::<Multiaddr>() {
-                                info!("🔗 [Identify] Đăng ký Relay Reservation qua Identify tới {}: {}", peer_id, p2p_only);
-                                let _ = self.swarm.listen_on(p2p_only);
-                                self.reserved_relays.insert(peer_id);
-                            }
-                        }
-                    }
-                    for addr in info.listen_addrs {
-                        if is_dialable_multiaddr(&addr) {
+
+                    for addr in &info.listen_addrs {
+                        if is_dialable_multiaddr(addr) {
                             self.swarm
                                 .behaviour_mut()
                                 .kademlia
@@ -685,7 +772,47 @@ impl P2PEventLoop {
                             self.known_peer_addrs
                                 .entry(peer_id)
                                 .or_default()
-                                .insert(addr);
+                                .insert(addr.clone());
+                        }
+                    }
+
+                    // Tự phát hiện Relay duy nhất bằng từ khóa "relay" do node tự công bố
+                    let is_relay = info.protocol_version.to_lowercase().contains("relay")
+                        || info.agent_version.to_lowercase().contains("relay")
+                        || info.protocols.iter().any(|p| p.to_string().to_lowercase().contains("relay"));
+
+                    if is_relay {
+                        self.discovered_relays.insert(peer_id);
+                        info!("🔎 [Identify] Xác nhận peer {} là Relay Server (protocol={}, agent={})", 
+                            peer_id, info.protocol_version, info.agent_version);
+
+                        // Tìm địa chỉ dialable cụ thể của Relay (không chứa /p2p-circuit)
+                        let candidate_addr = self.known_peer_addrs.get(&peer_id)
+                            .and_then(|addrs| addrs.iter().find(|a| !a.to_string().contains("/p2p-circuit")).cloned())
+                            .or_else(|| {
+                                info.listen_addrs.iter()
+                                    .find(|a| is_dialable_multiaddr(a) && !a.to_string().contains("/p2p-circuit"))
+                                    .cloned()
+                            });
+
+                        if let Some(base_addr) = candidate_addr {
+                            let relay_with_id = ensure_relay_peer_id(base_addr, &peer_id);
+                            self.known_relays.insert(relay_with_id.clone());
+
+                            if !self.reserved_relays.contains(&peer_id) {
+                                let circuit_addr = relay_with_id.with(libp2p::multiaddr::Protocol::P2pCircuit);
+                                info!("🔗 [Identify] Đang đăng ký Relay Circuit Reservation tại: {}", circuit_addr);
+                                match self.swarm.listen_on(circuit_addr) {
+                                    Ok(_) => {
+                                        self.reserved_relays.insert(peer_id);
+                                    }
+                                    Err(e) => {
+                                        warn!("❌ [Identify] Lỗi đăng ký circuit_addr trên Relay {}: {}", peer_id, e);
+                                    }
+                                }
+                            }
+                        } else {
+                            warn!("⚠️ Phát hiện Relay {} nhưng chưa có địa chỉ mạng cụ thể để tạo reservation", peer_id);
                         }
                     }
                 }
@@ -693,13 +820,17 @@ impl P2PEventLoop {
             SwarmEvent::NewListenAddr { address, .. } => {
                 let addr_str = address.to_string();
                 if addr_str.contains("/p2p-circuit/") || addr_str.contains("/p2p-circuit") {
+                    println!("🎉 Đã đăng ký thành công Relay Circuit: \x1b[1;32m{}\x1b[0m", address);
                     info!("🎉 Đã đăng ký thành công Relay Circuit: {}", address);
 
                     // 1. EVENT-DRIVEN IMMEDIATE HEARTBEAT: Bắn heartbeat ngay lập tức khi vừa có Circuit address!
                     if let Some((client, direct_addr, region)) = &self.rendezvous_info {
                         let client = client.clone();
                         let peer_id_str = self.local_peer_id.to_string();
-                        let mut addrs = vec![direct_addr.to_string()];
+                        let mut addrs = Vec::new();
+                        if is_dialable_multiaddr(direct_addr) {
+                            addrs.push(direct_addr.to_string());
+                        }
 
                         for l in self.swarm.listeners() {
                             let s = l.to_string();
@@ -771,7 +902,7 @@ impl P2PEventLoop {
                     let shard_len = push.data.len() as u64;
                     let quota_guard = self.quota_manager.read().await;
 
-                    if quota_guard.can_store_incoming_shard(&self.blockstore, shard_len) {
+                    if quota_guard.can_accept_shard(&self.blockstore, shard_len, false) {
                         drop(quota_guard);
 
                         if let Err(e) = self.blockstore.put_shard(&push.hash, &push.data) {
@@ -788,10 +919,13 @@ impl P2PEventLoop {
                             return;
                         }
 
+                        // Ghi nhận tăng stored_shard_bytes trong QuotaManager
+                        self.quota_manager.write().await.record_stored_shard(shard_len);
+
                         let key = RecordKey::new(&push.hash.as_bytes());
                         let _ = self.swarm.behaviour_mut().kademlia.start_providing(key);
 
-                        debug!("Đã nhận và lưu trữ shard {} từ peer {}", push.hash, peer);
+                        info!("📥 [Mesh Cache] Đã nhận và lưu trữ thành công shard cache {} ({:.2} KB) từ peer {}", push.hash, shard_len as f64 / 1024.0, peer);
                         let resp = ShardResponse::Push(PushResponse {
                             accepted: true,
                             reason: None,
@@ -802,10 +936,10 @@ impl P2PEventLoop {
                             .request_response
                             .send_response(channel, resp);
                     } else {
-                        warn!("Từ chối lưu shard {} vì vượt quá hạn mức ổ cứng", push.hash);
+                        warn!("Từ chối lưu shard {} vì vượt quá hạn mức ổ cứng hoặc trần cache (R > 5.0)", push.hash);
                         let resp = ShardResponse::Push(PushResponse {
                             accepted: false,
-                            reason: Some("Vượt quá hạn mức ổ cứng phân bổ".to_string()),
+                            reason: Some("Vượt quá hạn mức ổ cứng phân bổ hoặc trần cache".to_string()),
                         });
                         let _ = self
                             .swarm
@@ -823,6 +957,63 @@ impl P2PEventLoop {
                         data.is_some()
                     );
                     let resp = ShardResponse::Pull(PullResponse { data });
+                    let _ = self
+                        .swarm
+                        .behaviour_mut()
+                        .request_response
+                        .send_response(channel, resp);
+                }
+                ShardRequest::Prune(prune) => {
+                    let mut quota_guard = self.quota_manager.write().await;
+                    let has_shard = self.blockstore.has_shard(&prune.hash).unwrap_or(false);
+
+                    if has_shard {
+                        if let Ok(Some(data)) = self.blockstore.get_shard(&prune.hash) {
+                            let shard_len = data.len() as u64;
+                            let current_stored = quota_guard.stored_shard_bytes;
+                            let next_stored = current_stored.saturating_sub(shard_len);
+
+                            // Kiểm tra xem xóa shard có làm R < 4.0 hay không
+                            let can_prune = if quota_guard.my_uploaded_bytes == 0 {
+                                true
+                            } else {
+                                (next_stored as f64 / quota_guard.my_uploaded_bytes as f64) >= 4.0
+                            };
+
+                            if can_prune {
+                                let _ = self.blockstore.delete_shard(&prune.hash);
+                                quota_guard.record_pruned_shard(shard_len);
+                                info!("Đã thu hồi shard thừa {} theo yêu cầu mạng", prune.hash);
+                                let resp = ShardResponse::Prune(crate::protocol::PruneResponse {
+                                    pruned: true,
+                                    reason: None,
+                                });
+                                let _ = self
+                                    .swarm
+                                    .behaviour_mut()
+                                    .request_response
+                                    .send_response(channel, resp);
+                                return;
+                            } else {
+                                debug!("Từ chối xóa shard {} vì sẽ làm R < 4.0", prune.hash);
+                                let resp = ShardResponse::Prune(crate::protocol::PruneResponse {
+                                    pruned: false,
+                                    reason: Some("Không thể xóa: R sẽ tụt dưới 4.0".to_string()),
+                                });
+                                let _ = self
+                                    .swarm
+                                    .behaviour_mut()
+                                    .request_response
+                                    .send_response(channel, resp);
+                                return;
+                            }
+                        }
+                    }
+
+                    let resp = ShardResponse::Prune(crate::protocol::PruneResponse {
+                        pruned: false,
+                        reason: Some("Không tìm thấy shard trên node".to_string()),
+                    });
                     let _ = self
                         .swarm
                         .behaviour_mut()
@@ -904,20 +1095,82 @@ impl P2PEventLoop {
     }
 }
 
-fn is_dialable_multiaddr(addr: &Multiaddr) -> bool {
-    let s = addr.to_string();
-    if s.contains("/ip6/fe80:") || s.contains("/ip4/0.0.0.0/") || s.contains("/ip6/::/") {
-        return false;
-    }
-    // Không bao giờ dial 127.0.0.1 hoặc Docker private subnet (172.17.0.1) qua đường Circuit Relay
-    if (s.contains("/ip4/127.0.0.1/") || s.contains("/ip6/::1/") || s.contains("/ip4/172.17.")) && s.contains("/p2p-circuit/") {
-        return false;
-    }
-    // Bỏ qua địa chỉ trần chỉ có /p2p/<PeerID> mà thiếu transport (ip/dns/circuit)
-    if !s.contains("/ip4/") && !s.contains("/ip6/") && !s.contains("/dns4/") && !s.contains("/dns6/") && !s.contains("/dns/") {
-        return false;
-    }
+/// Kiểm tra xem địa chỉ IPv4 có phải là Public IP hợp lệ hay không (Whitelist).
+pub fn is_public_ipv4(ip: &std::net::Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    // 0.0.0.0/8 (Unspecified / Default route)
+    if octets[0] == 0 { return false; }
+    // 10.0.0.0/8 (Private LAN)
+    if octets[0] == 10 { return false; }
+    // 127.0.0.0/8 (Loopback localhost)
+    if octets[0] == 127 { return false; }
+    // 169.254.0.0/16 (Link-local APIPA)
+    if octets[0] == 169 && octets[1] == 254 { return false; }
+    // 172.16.0.0/12 (Private LAN & Docker bridges 172.17.x, 172.18.x, etc.)
+    if octets[0] == 172 && (16..=31).contains(&octets[1]) { return false; }
+    // 192.168.0.0/16 (Private LAN Router)
+    if octets[0] == 192 && octets[1] == 168 { return false; }
+    // 100.64.0.0/10 (Carrier-Grade NAT / Shared Address Space)
+    if octets[0] == 100 && (64..=127).contains(&octets[1]) { return false; }
+    // 198.18.0.0/15 (Benchmarking)
+    if octets[0] == 198 && (18..=19).contains(&octets[1]) { return false; }
+    // >= 224.0.0.0 (Multicast, Reserved, Broadcast)
+    if octets[0] >= 224 { return false; }
+    
     true
+}
+
+/// Kiểm tra xem địa chỉ IPv6 có phải là Public Global Unicast IP hợp lệ hay không (Whitelist).
+pub fn is_public_ipv6(ip: &std::net::Ipv6Addr) -> bool {
+    if ip.is_loopback() || ip.is_unspecified() { return false; }
+    let segs = ip.segments();
+    // fe80::/10 (Link-local)
+    if (segs[0] & 0xffc0) == 0xfe80 { return false; }
+    // fc00::/7 (Unique Local Address - Private LAN)
+    if (segs[0] & 0xfe00) == 0xfc00 { return false; }
+    // ff00::/8 (Multicast)
+    if (segs[0] & 0xff00) == 0xff00 { return false; }
+    
+    true
+}
+
+/// WHITELIST: Chỉ chấp nhận các địa chỉ công khai hợp lệ để broadcast/đăng ký sổ địa chỉ và quay số:
+/// 1. Địa chỉ Relay Circuit (`/p2p-circuit`)
+/// 2. Tên miền Public DNS (`/dns/`, `/dns4/`, `/dns6/`)
+/// 3. Địa chỉ Public IPv4 (đã qua kiểm tra Whitelist `is_public_ipv4`)
+/// 4. Địa chỉ Public IPv6 (đã qua kiểm tra Whitelist `is_public_ipv6`)
+pub fn is_dialable_multiaddr(addr: &Multiaddr) -> bool {
+    let mut has_valid_public_transport = false;
+
+    for proto in addr.iter() {
+        match proto {
+            libp2p::multiaddr::Protocol::P2pCircuit => {
+                has_valid_public_transport = true;
+            }
+            libp2p::multiaddr::Protocol::Dns(_)
+            | libp2p::multiaddr::Protocol::Dns4(_)
+            | libp2p::multiaddr::Protocol::Dns6(_) => {
+                has_valid_public_transport = true;
+            }
+            libp2p::multiaddr::Protocol::Ip4(ip) => {
+                if is_public_ipv4(&ip) {
+                    has_valid_public_transport = true;
+                } else {
+                    return false; // Chứa IPv4 private/loopback/docker -> Loại bỏ hoàn toàn khỏi Whitelist
+                }
+            }
+            libp2p::multiaddr::Protocol::Ip6(ip) => {
+                if is_public_ipv6(&ip) {
+                    has_valid_public_transport = true;
+                } else {
+                    return false; // Chứa IPv6 private/link-local -> Loại bỏ hoàn toàn khỏi Whitelist
+                }
+            }
+            _ => {}
+        }
+    }
+
+    has_valid_public_transport
 }
 
 fn extract_peer_id(addr: &Multiaddr) -> Option<PeerId> {

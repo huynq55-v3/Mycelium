@@ -92,30 +92,64 @@ enum Commands {
         file_path: PathBuf,
     },
 
-    /// [CLIENT MODE] Tải về và tái tạo tệp tin từ file manifest thông qua Daemon
+    /// [CLIENT MODE] Tải về và tái tạo tệp tin từ Virtual Tree hoặc manifest (*.manifest.json)
     Download {
-        /// Đường dẫn tới file manifest (*.manifest.json)
-        #[arg(value_name = "MANIFEST_PATH")]
-        manifest_path: PathBuf,
+        /// Đường dẫn tệp ảo (ví dụ /Documents/report.pdf) hoặc file manifest (*.manifest.json)
+        #[arg(value_name = "TARGET")]
+        target: String,
 
-        /// Đường dẫn tệp đích lưu kết quả khôi phục
+        /// Đường dẫn tệp đích lưu kết quả khôi phục (tùy chọn)
         #[arg(short, long, value_name = "OUTPUT_PATH")]
-        output: PathBuf,
+        output: Option<PathBuf>,
     },
 
-    /// [CLIENT MODE] Hiển thị thông tin trạng thái hoạt động của daemon, hạn ngạch và dung lượng
+    /// [CLIENT MODE] Hiển thị thông tin trạng thái hoạt động của daemon, hạn ngạch R và tệp tin thay đổi
     Status,
+
+    /// [CLIENT MODE] Commit các tệp tin / thư mục thay đổi vào Cây thư mục ảo (Virtual Tree) và đẩy lên P2P
+    Commit {
+        /// Danh sách đường dẫn tệp tin cần commit (để trống để commit toàn bộ ~/MyceliumDrive)
+        #[arg(value_name = "PATHS")]
+        paths: Vec<String>,
+
+        /// Thông điệp ghi chú commit
+        #[arg(short, long)]
+        message: Option<String>,
+    },
+
+    /// [CLIENT MODE] Liệt kê danh sách tệp tin trong Cây thư mục ảo (Virtual Tree)
+    Ls {
+        /// Đường dẫn thư mục ảo cần xem (mặc định xem root /)
+        #[arg(value_name = "PATH")]
+        path: Option<String>,
+    },
+
+    /// [CLIENT MODE] Vẽ cây phân cấp thư mục ảo (Virtual Tree)
+    Tree {
+        /// Đường dẫn thư mục ảo cần vẽ (mặc định vẽ root /)
+        #[arg(value_name = "PATH")]
+        path: Option<String>,
+    },
+
+    /// [CLIENT MODE] Xóa tệp tin hoặc thư mục khỏi Cây thư mục ảo (Virtual Tree)
+    Rm {
+        /// Đường dẫn tệp tin / thư mục ảo cần xóa (ví dụ /Documents/report.pdf)
+        #[arg(value_name = "PATH")]
+        path: String,
+    },
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Cấu hình logging với tracing
+    // Cấu hình logging với tracing: Mặc định hiện info của ứng dụng, ẩn log rác từ lib bên ngoài
     let filter = if cli.verbose {
-        EnvFilter::new("debug,network=debug,core_crypto=debug")
+        EnvFilter::new("debug,network=debug,core_crypto=debug,cli=debug")
     } else {
-        EnvFilter::new("warn")
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            EnvFilter::new("info,libp2p=warn,libp2p_kad=warn,reqwest=warn,hyper=warn,tower=warn")
+        })
     };
 
     tracing_subscriber::registry()
@@ -150,14 +184,29 @@ async fn main() -> Result<()> {
         Commands::Upload { file_path } => {
             commands::upload::handle_upload(file_path).await?;
         }
-        Commands::Download {
-            manifest_path,
-            output,
-        } => {
-            commands::download::handle_download(manifest_path, output).await?;
+        Commands::Download { target, output } => {
+            if target.ends_with(".json") && PathBuf::from(&target).exists() {
+                let out = output.unwrap_or_else(|| PathBuf::from("downloaded.bin"));
+                commands::download::handle_download(PathBuf::from(target), out).await?;
+            } else {
+                let out_str = output.map(|p| p.to_string_lossy().to_string());
+                commands::vfs_cmds::handle_vfs_download(target, out_str).await?;
+            }
         }
         Commands::Status => {
             commands::status::handle_status().await?;
+        }
+        Commands::Commit { paths, message } => {
+            commands::commit::handle_commit(paths, message).await?;
+        }
+        Commands::Ls { path } => {
+            commands::vfs_cmds::handle_ls(path).await?;
+        }
+        Commands::Tree { path } => {
+            commands::vfs_cmds::handle_tree(path).await?;
+        }
+        Commands::Rm { path } => {
+            commands::vfs_cmds::handle_rm(path).await?;
         }
     }
 

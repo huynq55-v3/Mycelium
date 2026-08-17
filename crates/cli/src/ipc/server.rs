@@ -113,6 +113,21 @@ impl IpcServer {
             IpcRequest::GetStatus => {
                 self.handle_status(&mut writer).await?;
             }
+            IpcRequest::Commit { paths, message } => {
+                self.handle_commit(paths, message, &mut writer).await?;
+            }
+            IpcRequest::VfsList { path } => {
+                self.handle_vfs_list(path, &mut writer).await?;
+            }
+            IpcRequest::VfsTree { path } => {
+                self.handle_vfs_tree(path, &mut writer).await?;
+            }
+            IpcRequest::VfsRemove { path } => {
+                self.handle_vfs_remove(path, &mut writer).await?;
+            }
+            IpcRequest::VfsDownload { vfs_path, output_path } => {
+                self.handle_vfs_download(vfs_path, output_path, &mut writer).await?;
+            }
         }
 
         Ok(())
@@ -502,17 +517,481 @@ impl IpcServer {
         Ok(())
     }
 
+    fn vfs_tree_path(&self) -> PathBuf {
+        AppConfig::config_dir()
+            .unwrap_or_else(|_| PathBuf::from(".p2pdrive"))
+            .join("vfs_tree.enc")
+    }
+
+    fn drive_dir_path(&self) -> PathBuf {
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        home.join("MyceliumDrive")
+    }
+
+    fn load_vfs_tree(&self) -> network::VirtualTree {
+        let path = self.vfs_tree_path();
+        if path.exists() {
+            if let Ok(bytes) = fs::read(&path) {
+                if let Ok(tree) = network::VirtualTree::decrypt_tree(&bytes, &self.identity) {
+                    return tree;
+                }
+            }
+        }
+        network::VirtualTree::new(&self.identity.to_did())
+    }
+
+    fn save_vfs_tree(&self, tree: &network::VirtualTree) -> Result<()> {
+        let path = self.vfs_tree_path();
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let enc_bytes = tree
+            .encrypt_tree(&self.identity)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        fs::write(path, enc_bytes)?;
+        Ok(())
+    }
+
+    fn collect_disk_files(dir: &Path, prefix: &str, out: &mut Vec<(String, PathBuf)>) {
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let file_name = entry.file_name().to_string_lossy().to_string();
+                if path.is_file() {
+                    let rel = if prefix.is_empty() {
+                        format!("/{}", file_name)
+                    } else {
+                        format!("{}/{}", prefix, file_name)
+                    };
+                    out.push((rel, path));
+                } else if path.is_dir() {
+                    let next_prefix = if prefix.is_empty() {
+                        format!("/{}", file_name)
+                    } else {
+                        format!("{}/{}", prefix, file_name)
+                    };
+                    Self::collect_disk_files(&path, &next_prefix, out);
+                }
+            }
+        }
+    }
+
+    fn detect_dirty_files(&self, tree: &network::VirtualTree) -> Vec<String> {
+        let mut dirty = Vec::new();
+        let drive_path = self.drive_dir_path();
+        if !drive_path.exists() {
+            let _ = fs::create_dir_all(&drive_path);
+        }
+
+        let mut disk_files = Vec::new();
+        Self::collect_disk_files(&drive_path, "", &mut disk_files);
+
+        for (vfs_path, path_on_disk) in &disk_files {
+            match tree.find_file(vfs_path) {
+                Some(file_node) => {
+                    if let Ok(meta) = fs::metadata(path_on_disk) {
+                        if meta.len() != file_node.size {
+                            dirty.push(format!("Modified: {vfs_path}"));
+                        }
+                    }
+                }
+                None => {
+                    dirty.push(format!("Added: {vfs_path}"));
+                }
+            }
+        }
+
+        for (vfs_path, _) in tree.list_all_files() {
+            let rel = vfs_path.trim_start_matches('/');
+            let disk_file = drive_path.join(rel);
+            if !disk_file.exists() {
+                dirty.push(format!("Deleted: {vfs_path}"));
+            }
+        }
+
+        dirty
+    }
+
+    async fn handle_commit<W: AsyncWriteExt + Unpin>(
+        &self,
+        paths: Vec<String>,
+        _message: Option<String>,
+        writer: &mut W,
+    ) -> Result<()> {
+        let mut tree = self.load_vfs_tree();
+        let drive_path = self.drive_dir_path();
+        let mut committed_files = Vec::new();
+        let mut total_bytes = 0u64;
+
+        // Nếu paths rỗng, quét toàn bộ ~/MyceliumDrive/
+        let target_paths = if paths.is_empty() {
+            let mut list = Vec::new();
+            let mut disk_files = Vec::new();
+            Self::collect_disk_files(&drive_path, "", &mut disk_files);
+            for (rel, _) in disk_files {
+                list.push(rel);
+            }
+            list
+        } else {
+            paths
+        };
+
+        // Kiểm tra xem có phải First Atomic Commit (Merit=0, Shard=0) không
+        let is_first_atomic_commit = {
+            let qm = self.quota_manager.read().await;
+            qm.my_uploaded_bytes == 0 && qm.stored_shard_bytes == 0
+        };
+
+        if is_first_atomic_commit {
+            let mut total_batch_size = 0u64;
+            for p in &target_paths {
+                let clean_p = if p.starts_with('/') { p.clone() } else { format!("/{}", p) };
+                let disk_path = if Path::new(&p).is_absolute() && Path::new(&p).exists() {
+                    PathBuf::from(&p)
+                } else {
+                    drive_path.join(clean_p.trim_start_matches('/'))
+                };
+                if disk_path.exists() {
+                    if let Ok(m) = fs::metadata(&disk_path) {
+                        total_batch_size += m.len();
+                    }
+                }
+            }
+
+            if total_batch_size < quota_manager::FIRST_COMMIT_MIN_BYTES
+                || total_batch_size > quota_manager::FIRST_COMMIT_MAX_BYTES
+            {
+                let total_mb = total_batch_size as f64 / (1024.0 * 1024.0);
+                Self::send_response(
+                    writer,
+                    &IpcResponse::Error(format!(
+                        "Lần commit đầu tiên yêu cầu tổng dung lượng từ 10 MB đến 40 MB để kích hoạt hệ sinh thái P2P (Hiện tại: {:.2} MB). Vui lòng thêm/bớt tệp tin phù hợp vào ~/MyceliumDrive.",
+                        total_mb
+                    )),
+                ).await?;
+                return Ok(());
+            }
+        }
+
+        for p in target_paths {
+            let clean_p = if p.starts_with('/') { p.clone() } else { format!("/{}", p) };
+            let disk_path = if Path::new(&p).is_absolute() && Path::new(&p).exists() {
+                PathBuf::from(&p)
+            } else {
+                drive_path.join(clean_p.trim_start_matches('/'))
+            };
+
+            if !disk_path.exists() {
+                // Nếu file bị xóa trên đĩa -> Xóa khỏi VFS Tree
+                if let Ok(Some(network::VfsEntry::File(f))) = tree.remove_path(&clean_p) {
+                    let mut qm = self.quota_manager.write().await;
+                    qm.record_delete(f.size);
+                    if let Ok(p) = AppConfig::config_dir() {
+                        let _ = qm.save_to_file(&p.join("quota.json"));
+                    }
+                    committed_files.push(format!("Deleted: {}", clean_p));
+                }
+                continue;
+            }
+
+            let meta = fs::metadata(&disk_path)?;
+            let file_size = meta.len();
+
+            // 1. Kiểm tra Quota / Atomic Ingest (chỉ kiểm tra nếu không phải first atomic batch)
+            if !is_first_atomic_commit {
+                let qm_guard = self.quota_manager.read().await;
+                let needed_ingest = qm_guard.calculate_required_ingest_for_upload(file_size);
+                drop(qm_guard);
+
+                if needed_ingest > 0 {
+                    Self::send_response(
+                        writer,
+                        &IpcResponse::Progress {
+                            step: "atomic_ingest".to_string(),
+                            current: 10,
+                            total: 100,
+                            message: format!("Đang nhận {} MB shard từ mạng để mở khóa upload...", needed_ingest / (1024 * 1024)),
+                        },
+                    ).await?;
+                }
+            }
+
+            // 2. Đọc file
+            let mut file = File::open(&disk_path)?;
+            let mut raw_data = Vec::with_capacity(file_size as usize);
+            file.read_to_end(&mut raw_data)?;
+
+            // 3. Sinh AES-256 Key ngẫu nhiên và mã hóa
+            let mut enc_key = [0u8; 32];
+            rand::thread_rng().fill_bytes(&mut enc_key);
+            let encrypted_data = match encrypt_data(&raw_data, &enc_key) {
+                Ok(data) => data,
+                Err(e) => {
+                    Self::send_response(writer, &IpcResponse::Error(format!("Lỗi mã hóa: {e}"))).await?;
+                    return Ok(());
+                }
+            };
+            let enc_cid = compute_cid(&encrypted_data);
+
+            // 4. Erasure Coding 1:4 (k=10, n=40 default trong erasure-codec)
+            let (manifest, shards) = match encode_with_name(&clean_p, &encrypted_data) {
+                Ok(res) => res,
+                Err(e) => {
+                    Self::send_response(writer, &IpcResponse::Error(format!("Lỗi Erasure Coding: {e}"))).await?;
+                    return Ok(());
+                }
+            };
+
+            // 5. Phân tán Shard qua P2P Network
+            Self::send_response(
+                writer,
+                &IpcResponse::Progress {
+                    step: "distributing".to_string(),
+                    current: 60,
+                    total: 100,
+                    message: format!("Đang phân tán {} shards cho {}...", manifest.n_total_shards, clean_p),
+                },
+            ).await?;
+
+            if let Err(e) = self.service.distribute_shards(shards).await {
+                Self::send_response(writer, &IpcResponse::Error(format!("Lỗi phân tán shards: {e}"))).await?;
+                return Ok(());
+            }
+
+            // 6. Cập nhật VirtualTree
+            let file_node = network::FileNode {
+                name: clean_p.split('/').last().unwrap_or("file").to_string(),
+                size: file_size,
+                encrypted_cid: enc_cid,
+                encryption_key_hex: hex::encode(enc_key),
+                k_data_shards: manifest.k_data_shards,
+                n_total_shards: manifest.n_total_shards,
+                shard_hashes: manifest.shard_hashes,
+                updated_at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+            };
+
+            tree.insert_file(&clean_p, file_node).map_err(|e| anyhow::anyhow!("{e}"))?;
+            
+            if !is_first_atomic_commit {
+                let mut qm = self.quota_manager.write().await;
+                let _ = qm.record_upload(file_size);
+                if let Ok(p) = AppConfig::config_dir() {
+                    let _ = qm.save_to_file(&p.join("quota.json"));
+                }
+            }
+
+            committed_files.push(format!("Committed: {}", clean_p));
+            total_bytes += file_size;
+
+            Self::send_response(
+                writer,
+                &IpcResponse::Progress {
+                    step: "completed".to_string(),
+                    current: 100,
+                    total: 100,
+                    message: format!("Cập nhật Cây ảo (VirtualTree) & Hoàn tất cho {}!", clean_p),
+                },
+            ).await?;
+        }
+
+        if is_first_atomic_commit && total_bytes > 0 {
+            let mut qm = self.quota_manager.write().await;
+            qm.my_uploaded_bytes = total_bytes;
+            qm.stored_shard_bytes = total_bytes.saturating_mul(4);
+            if let Ok(p) = AppConfig::config_dir() {
+                let _ = qm.save_to_file(&p.join("quota.json"));
+            }
+        }
+
+        self.save_vfs_tree(&tree)?;
+        let r_ratio = self.quota_manager.read().await.current_r_ratio();
+
+        Self::send_response(
+            writer,
+            &IpcResponse::CommitSuccess {
+                committed_files,
+                total_bytes,
+                r_ratio,
+            },
+        ).await?;
+
+        Ok(())
+    }
+
+    async fn handle_vfs_list<W: AsyncWriteExt + Unpin>(&self, _path: Option<String>, writer: &mut W) -> Result<()> {
+        let tree = self.load_vfs_tree();
+        let files = tree.list_all_files();
+        let entries = files
+            .into_iter()
+            .map(|(p, f)| format!("{} ({:.2} MB)", p, f.size as f64 / (1024.0 * 1024.0)))
+            .collect();
+
+        Self::send_response(writer, &IpcResponse::VfsListSuccess { entries }).await?;
+        Ok(())
+    }
+
+    async fn handle_vfs_tree<W: AsyncWriteExt + Unpin>(&self, _path: Option<String>, writer: &mut W) -> Result<()> {
+        let tree = self.load_vfs_tree();
+        let tree_rendered = tree.render_tree();
+        Self::send_response(writer, &IpcResponse::VfsTreeSuccess { tree_rendered }).await?;
+        Ok(())
+    }
+
+    async fn handle_vfs_remove<W: AsyncWriteExt + Unpin>(&self, path: String, writer: &mut W) -> Result<()> {
+        let mut tree = self.load_vfs_tree();
+        let clean_p = if path.starts_with('/') { path.clone() } else { format!("/{}", path) };
+
+        match tree.remove_path(&clean_p) {
+            Ok(Some(entry)) => {
+                let freed_bytes = match entry {
+                    network::VfsEntry::File(f) => {
+                        self.quota_manager.write().await.record_delete(f.size);
+                        f.size
+                    }
+                    network::VfsEntry::Dir(_) => 0,
+                };
+
+                self.save_vfs_tree(&tree)?;
+                let r_ratio = self.quota_manager.read().await.current_r_ratio();
+
+                Self::send_response(
+                    writer,
+                    &IpcResponse::VfsRemoveSuccess {
+                        path: clean_p,
+                        freed_bytes,
+                        r_ratio,
+                    },
+                ).await?;
+            }
+            _ => {
+                Self::send_response(writer, &IpcResponse::Error(format!("Không tìm thấy đường dẫn '{}'", clean_p))).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn handle_vfs_download<W: AsyncWriteExt + Unpin>(
+        &self,
+        vfs_path: String,
+        output_path: Option<String>,
+        writer: &mut W,
+    ) -> Result<()> {
+        let tree = self.load_vfs_tree();
+        let clean_p = if vfs_path.starts_with('/') { vfs_path.clone() } else { format!("/{}", vfs_path) };
+
+        let file_node = match tree.find_file(&clean_p) {
+            Some(f) => f.clone(),
+            None => {
+                Self::send_response(writer, &IpcResponse::Error(format!("Tệp '{}' không tồn tại trong Drive", clean_p))).await?;
+                return Ok(());
+            }
+        };
+
+        let target_out = match output_path {
+            Some(p) => PathBuf::from(p),
+            None => {
+                let file_name = clean_p.split('/').last().unwrap_or("downloaded.bin");
+                PathBuf::from(file_name)
+            }
+        };
+
+        Self::send_response(
+            writer,
+            &IpcResponse::Progress {
+                step: "fetching_shards".to_string(),
+                current: 20,
+                total: 100,
+                message: format!("Đang kéo tối thiểu {}/{} shards từ P2P Network...", file_node.k_data_shards, file_node.n_total_shards),
+            },
+        ).await?;
+
+        let collected_shards = match self
+            .service
+            .fetch_shards_parallel(file_node.shard_hashes.clone(), file_node.k_data_shards)
+            .await
+        {
+            Ok(shards) => shards,
+            Err(e) => {
+                Self::send_response(writer, &IpcResponse::Error(format!("Lỗi khi kéo shards: {e}"))).await?;
+                return Ok(());
+            }
+        };
+
+        let manifest = erasure_codec::FileManifest {
+            file_name: file_node.name.clone(),
+            original_size: 0,
+            original_hash: file_node.encrypted_cid.clone(),
+            k_data_shards: file_node.k_data_shards,
+            n_total_shards: file_node.n_total_shards,
+            shard_hashes: file_node.shard_hashes.clone(),
+        };
+
+        let mut sparse_shards = vec![None; file_node.n_total_shards];
+        for shard in collected_shards {
+            let idx = shard.index;
+            if idx < sparse_shards.len() {
+                sparse_shards[idx] = Some(shard);
+            }
+        }
+
+        let recovered_encrypted = match decode(&manifest, sparse_shards) {
+            Ok(data) => data,
+            Err(e) => {
+                Self::send_response(writer, &IpcResponse::Error(format!("Lỗi giải mã Reed-Solomon: {e}"))).await?;
+                return Ok(());
+            }
+        };
+
+        let key_bytes = hex::decode(&file_node.encryption_key_hex)?;
+        let mut enc_key = [0u8; 32];
+        enc_key.copy_from_slice(&key_bytes);
+
+        let decrypted_data = match decrypt_data(&recovered_encrypted, &enc_key) {
+            Ok(data) => data,
+            Err(e) => {
+                Self::send_response(writer, &IpcResponse::Error(format!("Lỗi giải mã AES: {e}"))).await?;
+                return Ok(());
+            }
+        };
+
+        if let Some(parent) = target_out.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let mut out_f = File::create(&target_out)?;
+        out_f.write_all(&decrypted_data)?;
+        out_f.flush()?;
+
+        Self::send_response(
+            writer,
+            &IpcResponse::DownloadSuccess {
+                file_name: file_node.name,
+                bytes_written: decrypted_data.len(),
+                output_path: target_out.to_string_lossy().to_string(),
+            },
+        ).await?;
+
+        Ok(())
+    }
+
     async fn handle_status<W: AsyncWriteExt + Unpin>(&self, writer: &mut W) -> Result<()> {
         let qm = self.quota_manager.read().await;
-        let allocated_gb = qm.allocated_disk_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
-        let upload_limit_gb = qm.allowed_upload_capacity() as f64 / (1024.0 * 1024.0 * 1024.0);
-        let upload_used_gb = qm.my_uploaded_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+        let merit_mb = qm.my_uploaded_bytes as f64 / (1024.0 * 1024.0);
+        let stored_shards_mb = qm.stored_shard_bytes as f64 / (1024.0 * 1024.0);
+        let r_ratio = qm.current_r_ratio();
+        let r_status = match r_ratio {
+            None => "⚡ Sẵn sàng cho First Atomic Commit (R = 4.0)".to_string(),
+            Some(r) if r < 4.0 => "🔴 Đang đói Shard (R < 4.0 - Cần nhận thêm Shard)".to_string(),
+            Some(r) if r <= 5.0 => "🟢 Cân bằng lý tưởng (4.0 <= R <= 5.0 - Sẵn sàng Upload)".to_string(),
+            Some(_) => "🟡 No nê / Chạm trần Cache (R > 5.0 - Tạm dừng nhận Cache)".to_string(),
+        };
         drop(qm);
 
         let shard_count = self.blockstore.count_shards();
-        let disk_used_mb = self.blockstore.current_disk_usage().unwrap_or(0) as f64 / (1024.0 * 1024.0);
+        let disk_used_mb = self.blockstore.total_payload_bytes().unwrap_or(0) as f64 / (1024.0 * 1024.0);
 
         let connected_peers = self.service.get_connected_peers().await.unwrap_or_default();
+        let known_peers = self.service.get_known_peers().await.unwrap_or_default();
         let listeners = self.service.get_listeners().await.unwrap_or_default();
 
         let rendezvous = RendezvousClient::new(&self.config.rendezvous_url);
@@ -527,6 +1006,8 @@ impl IpcServer {
         };
 
         let swarm_key_preview = self.swarm_key.as_ref().map(|k| k.to_hex()[..16].to_string());
+        let tree = self.load_vfs_tree();
+        let dirty_files = self.detect_dirty_files(&tree);
 
         let status_info = DaemonStatusInfo {
             did: self.identity.to_did(),
@@ -536,11 +1017,14 @@ impl IpcServer {
             rendezvous_online,
             shard_count,
             disk_used_mb,
-            allocated_gb,
-            upload_used_gb,
-            upload_limit_gb,
+            merit_mb,
+            stored_shards_mb,
+            r_ratio,
+            r_status,
             connected_peers_count: connected_peers.len(),
+            known_peers_count: known_peers.len(),
             listen_addrs: listeners.into_iter().map(|a| a.to_string()).collect(),
+            dirty_files,
         };
 
         Self::send_response(writer, &IpcResponse::StatusSuccess(status_info)).await?;

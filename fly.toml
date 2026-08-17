@@ -1,0 +1,30 @@
+app = "mycelium-relay"
+primary_region = "sin" # Khu vực Singapore (gần Việt Nam nhất, ping siêu thấp)
+
+[build]
+  dockerfile = "Dockerfile.relay"
+
+[http_service]
+  internal_schema = "http"
+
+[env]
+  PUBLIC_PORT = "4002"
+  # RENDEZVOUS_URL = "https://mycelium-rendezvous.your-subdomain.workers.dev"
+  # SWARM_KEY = "ec3cc9d9e675e662..."
+
+[[services]]
+  protocol = "tcp"
+  internal_port = 4002
+
+  [[services.ports]]
+    port = 4002
+
+  [[services.tcp_checks]]
+    interval = "15s"
+    timeout = "2s"
+    grace_period = "5s"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory_mb = 256

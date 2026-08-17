@@ -64,7 +64,7 @@ pub fn handle_init(
     let allocated_bytes = gb * 1024 * 1024 * 1024;
     let quota_path = config_dir.join("quota.json");
 
-    let quota_manager = if quota_path.exists() {
+    let _quota_manager = if quota_path.exists() {
         let mut qm = QuotaManager::load_from_file(&quota_path)?;
         qm.allocated_disk_bytes = allocated_bytes;
         qm.save_to_file(&quota_path)?;
@@ -75,9 +75,8 @@ pub fn handle_init(
         qm
     };
 
-    let allowed_upload_gb = quota_manager.allowed_upload_capacity() as f64 / (1024.0 * 1024.0 * 1024.0);
     println!("💾 Cam kết chia sẻ ổ cứng: \x1b[1;36m{} GB\x1b[0m", gb);
-    println!("🚀 Quyền tải lên an toàn (Tỷ lệ 1:4): \x1b[1;32m{:.2} GB\x1b[0m", allowed_upload_gb);
+    println!("⚡ Mô hình đồng thuận    : \x1b[1;32mAtomic First Commit (R = 4.0)\x1b[0m");
 
     // 4. Lưu AppConfig
     let rendezvous = rendezvous_url.unwrap_or_else(|| DEFAULT_RENDEZVOUS_URL.to_string());

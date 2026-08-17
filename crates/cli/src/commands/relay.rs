@@ -12,7 +12,10 @@ use libp2p::relay;
 use libp2p::swarm::{NetworkBehaviour, Swarm, SwarmEvent};
 use libp2p::Multiaddr;
 use network::transport::build_transport;
-use network::{behaviour::MYCELIUM_AGENT_VERSION, RendezvousClient};
+use network::{
+    behaviour::{MYCELIUM_RELAY_AGENT_VERSION, MYCELIUM_RELAY_PROTOCOL},
+    RendezvousClient,
+};
 use tokio::signal;
 use tracing::{debug, info, warn};
 
@@ -20,12 +23,15 @@ use crate::config::AppConfig;
 
 pub const DEFAULT_RELAY_PORT: u16 = 4002;
 
+use libp2p::ping;
+
 /// Hành vi mạng chuyên dụng cho Dedicated Relay Server (Không Storage, Không Quota, Không DHT Pollution).
 #[derive(NetworkBehaviour)]
 pub struct PureRelayBehaviour {
     pub identify: identify::Behaviour,
     pub relay_server: relay::Behaviour,
     pub autonat: autonat::Behaviour,
+    pub ping: ping::Behaviour,
 }
 
 async fn detect_public_or_lan_ip() -> String {
@@ -63,9 +69,16 @@ pub async fn handle_relay(
     swarm_key_opt: Option<PathBuf>,
 ) -> Result<()> {
     let listen_port = port_opt.unwrap_or(DEFAULT_RELAY_PORT);
-    let public_port = public_port_opt.unwrap_or(listen_port);
+    let public_port = public_port_opt
+        .or_else(|| std::env::var("PUBLIC_PORT").ok().and_then(|p| p.parse().ok()))
+        .unwrap_or(listen_port);
+    let public_host_resolved = public_host_opt
+        .or_else(|| std::env::var("PUBLIC_HOST").ok());
+
     let config = AppConfig::load_or_default();
-    let rendezvous_url = rendezvous_url_opt.unwrap_or(config.rendezvous_url);
+    let rendezvous_url = rendezvous_url_opt
+        .or_else(|| std::env::var("RENDEZVOUS_URL").ok())
+        .unwrap_or(config.rendezvous_url);
     let config_dir = AppConfig::config_dir()?;
 
     println!("============================================================");
@@ -79,20 +92,29 @@ pub async fn handle_relay(
         Identity::load_from_file(&relay_identity_path)?
     } else {
         let id = Identity::generate();
-        id.save_to_file(&relay_identity_path)?;
+        let _ = id.save_to_file(&relay_identity_path);
         id
     };
     println!("🆔 Relay DID: \x1b[1;32m{}\x1b[0m", identity.to_did());
 
-    // 2. Nạp SwarmKey
-    let swarm_key_path = swarm_key_opt.unwrap_or_else(|| config_dir.join("swarm.key"));
-    let swarm_key = if swarm_key_path.exists() {
-        let key = SwarmKey::load_from_file(&swarm_key_path)?;
-        println!("🔒 Swarm Grid: \x1b[1;33mPrivate Network\x1b[0m (Key: {}...)", &key.to_hex()[..12]);
-        Some(key)
+    // 2. Nạp SwarmKey (Hỗ trợ từ ENV SWARM_KEY hoặc file swarm.key)
+    let swarm_key = if let Ok(key_hex) = std::env::var("SWARM_KEY") {
+        if let Ok(key) = SwarmKey::from_hex(&key_hex) {
+            println!("🔒 Swarm Grid: \x1b[1;33mPrivate Network\x1b[0m (Key từ ENV: {}...)", &key.to_hex()[..12]);
+            Some(key)
+        } else {
+            None
+        }
     } else {
-        println!("🌐 Swarm Grid: \x1b[1;34mPublic Open Network\x1b[0m");
-        None
+        let swarm_key_path = swarm_key_opt.unwrap_or_else(|| config_dir.join("swarm.key"));
+        if swarm_key_path.exists() {
+            let key = SwarmKey::load_from_file(&swarm_key_path)?;
+            println!("🔒 Swarm Grid: \x1b[1;33mPrivate Network\x1b[0m (Key: {}...)", &key.to_hex()[..12]);
+            Some(key)
+        } else {
+            println!("🌐 Swarm Grid: \x1b[1;34mPublic Open Network\x1b[0m");
+            None
+        }
     };
 
     // 3. Khởi tạo Keypair & Transport
@@ -107,10 +129,10 @@ pub async fn handle_relay(
 
     // 4. Khởi tạo Behaviour
     let identify_config = IdentifyConfig::new(
-        "/mycelium/relay/1.0.0".to_string(),
+        MYCELIUM_RELAY_PROTOCOL.to_string(),
         keypair.public(),
     )
-    .with_agent_version(MYCELIUM_AGENT_VERSION.to_string());
+    .with_agent_version(MYCELIUM_RELAY_AGENT_VERSION.to_string());
     let identify = identify::Behaviour::new(identify_config);
 
     let relay_config = relay::Config {
@@ -124,18 +146,21 @@ pub async fn handle_relay(
     };
     let relay_server = relay::Behaviour::new(local_peer_id, relay_config);
     let autonat = autonat::Behaviour::new(local_peer_id, AutoNatConfig::default());
+    let ping = ping::Behaviour::new(ping::Config::new().with_interval(Duration::from_secs(15)));
 
     let behaviour = PureRelayBehaviour {
         identify,
         relay_server,
         autonat,
+        ping,
     };
 
     let mut swarm = Swarm::new(
         transport,
         behaviour,
         local_peer_id,
-        libp2p::swarm::Config::with_tokio_executor(),
+        libp2p::swarm::Config::with_tokio_executor()
+            .with_idle_connection_timeout(Duration::from_secs(86400 * 365)),
     );
 
     // 5. Lắng nghe Dual-Stack trên listen_port cục bộ
@@ -149,7 +174,7 @@ pub async fn handle_relay(
     }
 
     // 6. Phát hiện IP/Host và gửi Heartbeat lên Rendezvous Server
-    let host_or_ip = match public_host_opt {
+    let host_or_ip = match public_host_resolved {
         Some(host) => host,
         None => detect_public_or_lan_ip().await,
     };

@@ -5,17 +5,39 @@ pub const DEFAULT_IPC_ADDR: &str = "127.0.0.1:5001";
 /// Các yêu cầu từ Thin CLI Client gửi tới P2P Daemon qua Local IPC.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum IpcRequest {
-    /// Yêu cầu tải lên và phân tán tệp tin
+    /// Yêu cầu tải lên và phân tán tệp tin (Legacy Manifest-based)
     Upload {
         file_path: String,
     },
-    /// Yêu cầu tải về và khôi phục tệp tin từ manifest
+    /// Yêu cầu tải về và khôi phục tệp tin từ manifest (Legacy)
     Download {
         manifest_path: String,
         output_path: String,
     },
     /// Yêu cầu lấy thông tin trạng thái hoạt động của daemon
     GetStatus,
+    /// Yêu cầu Commit danh sách tệp tin vào cây thư mục ảo Virtual Tree
+    Commit {
+        paths: Vec<String>,
+        message: Option<String>,
+    },
+    /// Yêu cầu xem danh sách thư mục / tệp tin trong Virtual Tree
+    VfsList {
+        path: Option<String>,
+    },
+    /// Yêu cầu vẽ cây thư mục Virtual Tree
+    VfsTree {
+        path: Option<String>,
+    },
+    /// Yêu cầu xóa tệp tin / thư mục khỏi Virtual Tree
+    VfsRemove {
+        path: String,
+    },
+    /// Yêu cầu tải tệp tin từ Virtual Tree
+    VfsDownload {
+        vfs_path: String,
+        output_path: Option<String>,
+    },
 }
 
 /// Thông tin trạng thái của P2P Daemon trả về cho client.
@@ -28,11 +50,14 @@ pub struct DaemonStatusInfo {
     pub rendezvous_online: bool,
     pub shard_count: usize,
     pub disk_used_mb: f64,
-    pub allocated_gb: f64,
-    pub upload_used_gb: f64,
-    pub upload_limit_gb: f64,
+    pub merit_mb: f64,
+    pub stored_shards_mb: f64,
+    pub r_ratio: Option<f64>,
+    pub r_status: String,
     pub connected_peers_count: usize,
+    pub known_peers_count: usize,
     pub listen_addrs: Vec<String>,
+    pub dirty_files: Vec<String>,
 }
 
 /// Các phản hồi từ P2P Daemon gửi về cho Thin CLI Client.
@@ -57,6 +82,26 @@ pub enum IpcResponse {
         file_name: String,
         bytes_written: usize,
         output_path: String,
+    },
+    /// Kết quả hoàn thành Commit Virtual Tree
+    CommitSuccess {
+        committed_files: Vec<String>,
+        total_bytes: u64,
+        r_ratio: Option<f64>,
+    },
+    /// Kết quả liệt kê VFS
+    VfsListSuccess {
+        entries: Vec<String>,
+    },
+    /// Kết quả vẽ cây VFS
+    VfsTreeSuccess {
+        tree_rendered: String,
+    },
+    /// Kết quả xóa VFS
+    VfsRemoveSuccess {
+        path: String,
+        freed_bytes: u64,
+        r_ratio: Option<f64>,
     },
     /// Kết quả truy vấn trạng thái
     StatusSuccess(DaemonStatusInfo),

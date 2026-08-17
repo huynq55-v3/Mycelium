@@ -82,7 +82,7 @@ pub async fn handle_daemon(
     let blockstore_path = config_dir.join("blockstore");
     let blockstore = BlockStore::open(&blockstore_path)
         .context("Không thể mở BlockStore trên đĩa")?;
-    let disk_used_mb = blockstore.current_disk_usage().unwrap_or(0) as f64 / (1024.0 * 1024.0);
+    let disk_used_mb = blockstore.total_payload_bytes().unwrap_or(0) as f64 / (1024.0 * 1024.0);
     println!("🗄️ BlockStore: {:?} (Số shards: {}, Dung lượng: {:.2} MB)",
         blockstore_path, blockstore.count_shards(), disk_used_mb);
 
@@ -103,18 +103,17 @@ pub async fn handle_daemon(
         quota_manager.clone(),
     ).context("Khởi tạo P2PService thất bại")?;
 
-    // Lắng nghe Dual-Stack: IPv4
+    // 5. Lắng nghe P2P Dual-Stack (IPv4 & IPv6)
     let ipv4_addr: Multiaddr = format!("/ip4/0.0.0.0/tcp/{}", port).parse()?;
     service.listen_on(ipv4_addr.clone()).await?;
     println!("👂 P2P Network: Đang lắng nghe tại \x1b[1;36m{}\x1b[0m", ipv4_addr);
 
-    // Lắng nghe IPv6 nếu hệ điều hành hỗ trợ
     let ipv6_addr: Multiaddr = format!("/ip6/::/tcp/{}", port).parse()?;
     if let Ok(_) = service.listen_on(ipv6_addr.clone()).await {
         println!("🌐 IPv6 Dual-Stack: Đang lắng nghe tại \x1b[1;36m{}\x1b[0m", ipv6_addr);
     }
 
-    // 6. Xác định IP Public của node để công bố lên Rendezvous
+    // 6. Xác định IP Public của node để công bố lên Rendezvous (Whitelist)
     let resolved_ip = match public_ip_opt {
         Some(ip) => ip,
         None => detect_public_or_lan_ip().await,
@@ -122,7 +121,13 @@ pub async fn handle_daemon(
 
     let is_v6 = resolved_ip.contains(':');
     let proto_prefix = if is_v6 { "ip6" } else { "ip4" };
-    println!("🌐 Địa chỉ IP công bố: \x1b[1;32m{}\x1b[0m ({})", resolved_ip, proto_prefix.to_uppercase());
+    let public_multiaddr: Multiaddr = format!("/{}/{}/tcp/{}/p2p/{}", proto_prefix, resolved_ip, port, service.local_peer_id()).parse()?;
+
+    if network::service::is_dialable_multiaddr(&public_multiaddr) {
+        println!("🌐 Địa chỉ IP Public công bố: \x1b[1;32m{}\x1b[0m ({})", resolved_ip, proto_prefix.to_uppercase());
+    } else {
+        println!("🔒 Node đang ở Private IP ({}), đăng ký sổ địa chỉ định tuyến qua Relay Circuit.", resolved_ip);
+    }
 
     // 7. Rendezvous Bootstrap, Heartbeat & Dynamic Peer Keeper
     let rendezvous = RendezvousClient::new(&rendezvous_url);

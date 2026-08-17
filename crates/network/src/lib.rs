@@ -13,6 +13,7 @@ pub mod protocol;
 pub mod rendezvous;
 pub mod service;
 pub mod transport;
+pub mod vfs;
 
 // Re-exports
 pub use behaviour::{MyceliumBehaviour, MYCELIUM_STORAGE_PROTOCOL};
@@ -23,3 +24,4 @@ pub use protocol::{
 pub use rendezvous::{HeartbeatRequest, PeersResponse, RendezvousClient};
 pub use service::P2PService;
 pub use transport::build_transport;
+pub use vfs::{DirectoryNode, FileNode, VfsEntry, VirtualTree};

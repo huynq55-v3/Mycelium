@@ -32,15 +32,37 @@ pub async fn handle_status() -> Result<()> {
                 println!("🗄️ BlockStore      : {} shards lưu trữ ({:.2} MB trên đĩa)",
                     info.shard_count, info.disk_used_mb);
 
-                let disk_used_gb = info.disk_used_mb / 1024.0;
-                let percent_disk = (disk_used_gb / info.allocated_gb.max(1.0)) * 100.0;
-                println!("💾 Ổ đĩa đóng góp : \x1b[1;36m{:.2} GB / {:.0} GB\x1b[0m ({:.1}%)",
-                    disk_used_gb, info.allocated_gb, percent_disk);
+                println!("📦 Đã Upload (Merit) : \x1b[1;32m{:.2} MB\x1b[0m", info.merit_mb);
+                println!("🛡️ Shard Đang Giữ    : \x1b[1;36m{:.2} MB\x1b[0m", info.stored_shards_mb);
+                let r_ratio_str = match info.r_ratio {
+                    Some(r) => format!("\x1b[1;33m{:.3}\x1b[0m (Shard / Merit)", r),
+                    None => "\x1b[1;33mN/A\x1b[0m".to_string(),
+                };
+                println!("📈 Chỉ số cống hiến R: {} | {}", r_ratio_str, info.r_status);
 
-                println!("🚀 Hạn mức tải lên : \x1b[1;32m{:.2} GB / {:.2} GB\x1b[0m (Tỷ lệ 1:4 an toàn)",
-                    info.upload_used_gb, info.upload_limit_gb);
+                if info.known_peers_count > 0 {
+                    println!("👥 Peers trong mạng : \x1b[1;35m{} active\x1b[0m / \x1b[1;32m{} storage peers\x1b[0m (On-Demand)", 
+                        info.connected_peers_count, info.known_peers_count);
+                } else {
+                    println!("👥 Peers kết nối   : \x1b[1;35m{} peers\x1b[0m", info.connected_peers_count);
+                }
 
-                println!("👥 Peers kết nối  : \x1b[1;35m{} peers\x1b[0m", info.connected_peers_count);
+                if !info.dirty_files.is_empty() {
+                    println!("------------------------------------------------------------");
+                    println!("📝 Tệp tin có thay đổi chưa Commit (~/MyceliumDrive):");
+                    for f in &info.dirty_files {
+                        if f.starts_with("Added:") {
+                            println!("   \x1b[1;32m+\x1b[0m {}", f);
+                        } else if f.starts_with("Modified:") {
+                            println!("   \x1b[1;33m~\x1b[0m {}", f);
+                        } else if f.starts_with("Deleted:") {
+                            println!("   \x1b[1;31m-\x1b[0m {}", f);
+                        } else {
+                            println!("   - {}", f);
+                        }
+                    }
+                    println!("💡 Gõ \x1b[1;36mp2pdrive commit\x1b[0m để đẩy thay đổi lên mạng P2P.");
+                }
 
                 if !info.listen_addrs.is_empty() {
                     println!("👂 Địa chỉ lắng nghe:");

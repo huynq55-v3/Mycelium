@@ -1,0 +1,8 @@
+name = "mycelium-rendezvous"
+main = "worker.js"
+compatibility_date = "2024-01-01"
+
+# Tùy chọn: KV namespace nếu muốn đồng bộ toàn cầu giữa các Data Center của Cloudflare
+# [[kv_namespaces]]
+# binding = "MYCELIUM_KV"
+# id = "<id_cua_ban>"

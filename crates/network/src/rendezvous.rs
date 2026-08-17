@@ -9,7 +9,7 @@ use tracing::{debug, info, warn};
 use crate::error::NetworkError;
 
 const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_secs(5);
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30); // 30 giây
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60); // 60 giây
 
 /// Payload gửi lên Rendezvous Server qua endpoint `/heartbeat`.
 #[derive(Debug, Serialize, Deserialize)]
@@ -174,9 +174,9 @@ impl RendezvousClient {
         let peer_id_str = local_peer_id.to_string();
 
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
             info!(
-                "Đã khởi động Dynamic Heartbeat Loop tới {} (chu kỳ 30s)",
+                "Đã khởi động Dynamic Heartbeat Loop tới {} (chu kỳ 60s)",
                 client.endpoint_url
             );
 
@@ -184,7 +184,10 @@ impl RendezvousClient {
                 interval.tick().await;
 
                 let listeners = service.get_listeners().await.unwrap_or_default();
-                let mut addrs = vec![direct_multiaddr.to_string()];
+                let mut addrs = Vec::new();
+                if crate::service::is_dialable_multiaddr(&direct_multiaddr) {
+                    addrs.push(direct_multiaddr.to_string());
+                }
 
                 for l in listeners {
                     let s = l.to_string();

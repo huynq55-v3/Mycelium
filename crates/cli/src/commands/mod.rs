@@ -1,6 +1,8 @@
+pub mod commit;
 pub mod daemon;
 pub mod download;
 pub mod init;
 pub mod relay;
 pub mod status;
 pub mod upload;
+pub mod vfs_cmds;

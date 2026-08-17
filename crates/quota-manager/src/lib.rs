@@ -6,6 +6,8 @@
 pub mod error;
 pub mod manager;
 
-// Re-exports
 pub use error::QuotaError;
-pub use manager::{QuotaManager, DEFAULT_ALLOCATED_DISK_BYTES, REDUNDANCY_FACTOR};
+pub use manager::{
+    QuotaManager, DEFAULT_ALLOCATED_DISK_BYTES, FIRST_COMMIT_MAX_BYTES, FIRST_COMMIT_MIN_BYTES,
+    MAX_R_RATIO, MIN_R_RATIO,
+};
