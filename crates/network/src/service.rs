@@ -397,7 +397,7 @@ impl P2PEventLoop {
                             .kademlia
                             .add_address(&peer_id, addr.clone());
 
-                        // ĐỀ XUẤT 1: Tự động ghép nối đường Circuit tức thì với mọi Relay đã biết (không cần chờ)
+                        // Ghi nhận địa chỉ vào Kademlia và bảng địa chỉ
                         if !is_relay_server {
                             for relay_addr in &self.known_relays {
                                 if let Some(relay_id) = extract_peer_id(relay_addr) {
@@ -414,17 +414,12 @@ impl P2PEventLoop {
                                     self.swarm
                                         .behaviour_mut()
                                         .kademlia
-                                        .add_address(&peer_id, circuit_addr.clone());
-
-                                    if self.connected_peers.contains(&relay_id) && !self.connected_peers.contains(&peer_id) {
-                                        info!("⚡ Tự động nối cầu tức thì qua Relay Circuit tới peer: {} ({})", peer_id, circuit_addr);
-                                        let _ = self.swarm.dial(circuit_addr);
-                                    }
+                                        .add_address(&peer_id, circuit_addr);
                                 }
                             }
                         }
 
-                        // Nếu chưa kết nối tới peer này, chủ động dial (chỉ dial direct ban đầu; circuit dial sẽ kích hoạt ngay khi Relay kết nối)
+                        // Nếu chưa kết nối tới peer này, chủ động dial (chỉ dial direct ban đầu; circuit dial sẽ kích hoạt khi Relay cấp phép Reservation)
                         if !self.connected_peers.contains(&peer_id) && !addr_str.contains("/p2p-circuit/") {
                             if is_relay_server {
                                 info!("🔄 Đang quay số kết nối tới Relay: {} ({})", peer_id, addr);
@@ -900,8 +895,8 @@ fn is_dialable_multiaddr(addr: &Multiaddr) -> bool {
     if s.contains("/ip6/fe80:") || s.contains("/ip4/0.0.0.0/") || s.contains("/ip6/::/") {
         return false;
     }
-    // Không bao giờ dial 127.0.0.1 qua đường Circuit Relay
-    if (s.contains("/ip4/127.0.0.1/") || s.contains("/ip6/::1/")) && s.contains("/p2p-circuit/") {
+    // Không bao giờ dial 127.0.0.1 hoặc Docker private subnet (172.17.0.1) qua đường Circuit Relay
+    if (s.contains("/ip4/127.0.0.1/") || s.contains("/ip6/::1/") || s.contains("/ip4/172.17.")) && s.contains("/p2p-circuit/") {
         return false;
     }
     // Bỏ qua địa chỉ trần chỉ có /p2p/<PeerID> mà thiếu transport (ip/dns/circuit)
