@@ -8,26 +8,21 @@ use futures::StreamExt;
 use libp2p::autonat::{self, Config as AutoNatConfig};
 use libp2p::identify::{self, Config as IdentifyConfig};
 use libp2p::identity::Keypair;
-use libp2p::kad::store::MemoryStore;
-use libp2p::kad::{self, Config as KadConfig};
-use libp2p::mdns::{self, Config as MdnsConfig};
 use libp2p::relay;
 use libp2p::swarm::{NetworkBehaviour, Swarm, SwarmEvent};
 use libp2p::Multiaddr;
 use network::transport::build_transport;
-use network::{behaviour::MYCELIUM_AGENT_VERSION, behaviour::MYCELIUM_KAD_PROTOCOL, RendezvousClient};
+use network::{behaviour::MYCELIUM_AGENT_VERSION, RendezvousClient};
 use tokio::signal;
-use tracing::{debug, info, trace};
+use tracing::{debug, info, warn};
 
 use crate::config::AppConfig;
 
 pub const DEFAULT_RELAY_PORT: u16 = 4002;
 
-/// Hành vi mạng chuyên dụng cho Dedicated Relay Server (Không Storage, Không Quota).
+/// Hành vi mạng chuyên dụng cho Dedicated Relay Server (Không Storage, Không Quota, Không DHT Pollution).
 #[derive(NetworkBehaviour)]
 pub struct PureRelayBehaviour {
-    pub kademlia: kad::Behaviour<MemoryStore>,
-    pub mdns: mdns::tokio::Behaviour,
     pub identify: identify::Behaviour,
     pub relay_server: relay::Behaviour,
     pub autonat: autonat::Behaviour,
@@ -111,14 +106,6 @@ pub async fn handle_relay(
         .context("Lỗi khởi tạo Transport")?;
 
     // 4. Khởi tạo Behaviour
-    let mut kad_config = KadConfig::new(MYCELIUM_KAD_PROTOCOL);
-    kad_config.set_query_timeout(Duration::from_secs(20));
-    let store = MemoryStore::new(local_peer_id);
-    let kademlia = kad::Behaviour::with_config(local_peer_id, store, kad_config);
-
-    let mdns = mdns::tokio::Behaviour::new(MdnsConfig::default(), local_peer_id)
-        .context("Lỗi khởi tạo mDNS")?;
-
     let identify_config = IdentifyConfig::new(
         "/mycelium/relay/1.0.0".to_string(),
         keypair.public(),
@@ -131,14 +118,14 @@ pub async fn handle_relay(
         max_circuits: 512,
         max_circuit_duration: Duration::from_secs(300),
         max_circuit_bytes: 1024 * 1024 * 500, // 500 MB per circuit
+        reservation_rate_limiters: vec![],
+        circuit_src_rate_limiters: vec![],
         ..Default::default()
     };
     let relay_server = relay::Behaviour::new(local_peer_id, relay_config);
     let autonat = autonat::Behaviour::new(local_peer_id, AutoNatConfig::default());
 
     let behaviour = PureRelayBehaviour {
-        kademlia,
-        mdns,
         identify,
         relay_server,
         autonat,
@@ -207,18 +194,33 @@ pub async fn handle_relay(
                     SwarmEvent::NewListenAddr { address, .. } => {
                         debug!("Relay mở listener mới: {}", address);
                     }
-                    SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                        info!("🤝 Peer kết nối vào Relay: {}", peer_id);
+                    SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                        info!("🤝 [RELAY] Peer đã kết nối thành công: {} ({:?})", peer_id, endpoint.get_remote_address());
                     }
                     SwarmEvent::ConnectionClosed { peer_id, .. } => {
-                        debug!("Peer ngắt kết nối khỏi Relay: {}", peer_id);
+                        info!("👋 [RELAY] Peer đã ngắt kết nối: {}", peer_id);
                     }
-                    SwarmEvent::Behaviour(PureRelayBehaviourEvent::Identify(identify_event)) => {
-                        if let libp2p::identify::Event::Received { peer_id, info, .. } = identify_event {
-                            trace!("Relay Identify từ {}: {:?}", peer_id, info.listen_addrs);
-                            for addr in info.listen_addrs {
-                                swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
+                    SwarmEvent::Behaviour(PureRelayBehaviourEvent::RelayServer(relay_event)) => {
+                        match relay_event {
+                            relay::Event::ReservationReqAccepted { src_peer_id, renewed } => {
+                                info!("🎉 [RELAY] Đã cấp Reservation thành công cho peer: {} (renewed={})", src_peer_id, renewed);
                             }
+                            relay::Event::ReservationReqDenied { src_peer_id } => {
+                                warn!("❌ [RELAY] TỪ CHỐI cấp Reservation cho peer: {}", src_peer_id);
+                            }
+                            relay::Event::ReservationTimedOut { src_peer_id } => {
+                                debug!("⏳ [RELAY] Reservation của peer {} đã hết hạn (Timed Out)", src_peer_id);
+                            }
+                            relay::Event::CircuitReqAccepted { src_peer_id, dst_peer_id } => {
+                                info!("⚡ [RELAY] ĐANG BẮC CẦU THÔNG SUỐT: {} <=====> {}", src_peer_id, dst_peer_id);
+                            }
+                            relay::Event::CircuitReqDenied { src_peer_id, dst_peer_id } => {
+                                warn!("❌ [RELAY] TỪ CHỐI bắc cầu Circuit: {} ----> {}", src_peer_id, dst_peer_id);
+                            }
+                            relay::Event::CircuitClosed { src_peer_id, dst_peer_id, error } => {
+                                info!("🔌 [RELAY] Đã đóng cầu nối: {} <=====> {} (lý do: {:?})", src_peer_id, dst_peer_id, error);
+                            }
+                            _ => {}
                         }
                     }
                     _ => {}

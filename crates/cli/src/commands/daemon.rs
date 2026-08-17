@@ -130,7 +130,10 @@ pub async fn handle_daemon(
 
     let public_multiaddr: Multiaddr = format!("/{}/{}/tcp/{}/p2p/{}", proto_prefix, resolved_ip, port, service.local_peer_id()).parse()?;
     
-    // Heartbeat định kỳ và cập nhật linh hoạt Circuit Relay multiaddr
+    // Đăng ký Rendezvous với Service để tự động kích hoạt Immediate Heartbeat khi có Circuit
+    let _ = service.register_rendezvous(rendezvous.clone(), public_multiaddr.clone(), Some("VN".to_string())).await;
+
+    // Heartbeat định kỳ 30s và cập nhật linh hoạt Circuit Relay multiaddr
     let _heartbeat_handle = rendezvous.start_dynamic_heartbeat_loop(
         service.clone(),
         public_multiaddr,

@@ -56,6 +56,12 @@ enum P2PCommand {
     GetListeners {
         respond_to: oneshot::Sender<Vec<Multiaddr>>,
     },
+    RegisterRendezvous {
+        rendezvous: RendezvousClient,
+        public_multiaddr: Multiaddr,
+        region: Option<String>,
+        respond_to: oneshot::Sender<Result<(), NetworkError>>,
+    },
 }
 
 /// Handle giao tiếp bất đồng bộ, luồng an toàn với `P2PService` background task.
@@ -173,6 +179,26 @@ impl P2PService {
         rx.await.map_err(|e| NetworkError::ChannelClosed(e.to_string()))?
     }
 
+    /// Đăng ký thông tin Rendezvous để EventLoop tự động kích hoạt Immediate Heartbeat khi có Circuit address.
+    pub async fn register_rendezvous(
+        &self,
+        rendezvous: RendezvousClient,
+        public_multiaddr: Multiaddr,
+        region: Option<String>,
+    ) -> Result<(), NetworkError> {
+        let (tx, rx) = oneshot::channel();
+        self.command_tx
+            .send(P2PCommand::RegisterRendezvous {
+                rendezvous,
+                public_multiaddr,
+                region,
+                respond_to: tx,
+            })
+            .await
+            .map_err(|e| NetworkError::ChannelClosed(e.to_string()))?;
+        rx.await.map_err(|e| NetworkError::ChannelClosed(e.to_string()))?
+    }
+
     /// Khởi động vòng lặp tự động duy trì kết nối và tìm kiếm Peer mới qua Rendezvous Server (mỗi 15 giây).
     pub fn start_auto_discovery_loop(
         &self,
@@ -251,11 +277,14 @@ struct P2PEventLoop {
     quota_manager: Arc<RwLock<QuotaManager>>,
     local_peer_id: PeerId,
     connected_peers: HashSet<PeerId>,
+    discovered_relays: HashSet<PeerId>,
     reserved_relays: HashSet<PeerId>,
+    known_relays: HashSet<Multiaddr>,
     known_peer_addrs: HashMap<PeerId, HashSet<Multiaddr>>,
     pending_fetches: HashMap<request_response::OutboundRequestId, usize>,
     fetch_sessions: HashMap<usize, PendingFetchRequest>,
     next_fetch_session_id: usize,
+    rendezvous_info: Option<(RendezvousClient, Multiaddr, Option<String>)>,
 }
 
 impl P2PEventLoop {
@@ -273,11 +302,14 @@ impl P2PEventLoop {
             quota_manager,
             local_peer_id,
             connected_peers: HashSet::new(),
+            discovered_relays: HashSet::new(),
             reserved_relays: HashSet::new(),
+            known_relays: HashSet::new(),
             known_peer_addrs: HashMap::new(),
             pending_fetches: HashMap::new(),
             fetch_sessions: HashMap::new(),
             next_fetch_session_id: 1,
+            rendezvous_info: None,
         }
     }
 
@@ -298,6 +330,15 @@ impl P2PEventLoop {
 
     async fn handle_command(&mut self, cmd: P2PCommand) {
         match cmd {
+            P2PCommand::RegisterRendezvous {
+                rendezvous,
+                public_multiaddr,
+                region,
+                respond_to,
+            } => {
+                self.rendezvous_info = Some((rendezvous, public_multiaddr, region));
+                let _ = respond_to.send(Ok(()));
+            }
             P2PCommand::ListenOn { addr, respond_to } => {
                 match self.swarm.listen_on(addr) {
                     Ok(_) => {
@@ -320,6 +361,7 @@ impl P2PEventLoop {
             }
             P2PCommand::BootstrapPeers { peers, respond_to } => {
                 let mut added = 0;
+                info!("📡 Bootstrap: Đang xử lý {} địa chỉ từ Rendezvous...", peers.len());
 
                 for addr in peers {
                     if !is_dialable_multiaddr(&addr) {
@@ -329,6 +371,20 @@ impl P2PEventLoop {
                     if let Some(peer_id) = extract_peer_id(&addr) {
                         if peer_id == self.local_peer_id {
                             continue;
+                        }
+
+                        let addr_str = addr.to_string();
+                        let is_relay_server = (addr_str.contains("ngrok")
+                            || addr_str.contains("relay")
+                            || addr_str.contains("/dns")
+                            || addr_str.contains("/tcp/4002"))
+                            && !addr_str.contains("/p2p-circuit/");
+
+                        if is_relay_server {
+                            self.discovered_relays.insert(peer_id);
+                            let relay_with_id = ensure_relay_peer_id(addr.clone(), &peer_id);
+                            self.known_relays.insert(relay_with_id);
+                            info!("🔎 Phát hiện Relay Server trong mạng: {} ({})", peer_id, addr);
                         }
 
                         self.known_peer_addrs
@@ -341,22 +397,47 @@ impl P2PEventLoop {
                             .kademlia
                             .add_address(&peer_id, addr.clone());
 
-                        // Nếu chưa kết nối tới peer này, chủ động dial
-                        if !self.connected_peers.contains(&peer_id) {
-                            debug!("Chủ động kết nối tới peer: {} ({})", peer_id, addr);
+                        // ĐỀ XUẤT 1: Tự động ghép nối đường Circuit tức thì với mọi Relay đã biết (không cần chờ)
+                        if !is_relay_server {
+                            for relay_addr in &self.known_relays {
+                                if let Some(relay_id) = extract_peer_id(relay_addr) {
+                                    let relay_with_id = ensure_relay_peer_id(relay_addr.clone(), &relay_id);
+                                    let circuit_addr = relay_with_id
+                                        .with(libp2p::multiaddr::Protocol::P2pCircuit)
+                                        .with(libp2p::multiaddr::Protocol::P2p(peer_id));
+
+                                    self.known_peer_addrs
+                                        .entry(peer_id)
+                                        .or_default()
+                                        .insert(circuit_addr.clone());
+
+                                    self.swarm
+                                        .behaviour_mut()
+                                        .kademlia
+                                        .add_address(&peer_id, circuit_addr.clone());
+
+                                    if self.connected_peers.contains(&relay_id) && !self.connected_peers.contains(&peer_id) {
+                                        info!("⚡ Tự động nối cầu tức thì qua Relay Circuit tới peer: {} ({})", peer_id, circuit_addr);
+                                        let _ = self.swarm.dial(circuit_addr);
+                                    }
+                                }
+                            }
+                        }
+
+                        // Nếu chưa kết nối tới peer này, chủ động dial (chỉ dial direct ban đầu; circuit dial sẽ kích hoạt ngay khi Relay kết nối)
+                        if !self.connected_peers.contains(&peer_id) && !addr_str.contains("/p2p-circuit/") {
+                            if is_relay_server {
+                                info!("🔄 Đang quay số kết nối tới Relay: {} ({})", peer_id, addr);
+                            } else {
+                                info!("🔄 Đang quay số kết nối tới Peer: {} ({})", peer_id, addr);
+                            }
                             let _ = self.swarm.dial(addr.clone());
                         }
 
-                        // Nếu đây là địa chỉ Relay thuần túy (không phải circuit), tự động đăng ký Reservation
-                        let addr_str = addr.to_string();
-                        let is_relay_server = (addr_str.contains("ngrok")
-                            || addr_str.contains("relay")
-                            || addr_str.contains("/tcp/4002"))
-                            && !addr_str.contains("/p2p-circuit/");
-
                         if is_relay_server && !self.reserved_relays.contains(&peer_id) {
-                            let circuit_addr = addr.with(libp2p::multiaddr::Protocol::P2pCircuit);
-                            debug!("Đang đăng ký Relay Circuit Reservation tại: {}", circuit_addr);
+                            let relay_with_id = ensure_relay_peer_id(addr.clone(), &peer_id);
+                            let circuit_addr = relay_with_id.with(libp2p::multiaddr::Protocol::P2pCircuit);
+                            info!("🔗 Đang gửi yêu cầu Relay Circuit Reservation tại: {}", circuit_addr);
                             if let Ok(_) = self.swarm.listen_on(circuit_addr) {
                                 self.reserved_relays.insert(peer_id);
                             }
@@ -428,7 +509,7 @@ impl P2PEventLoop {
                     if !self.connected_peers.contains(peer_id) {
                         for addr in addrs {
                             if is_dialable_multiaddr(addr) {
-                                debug!("Đang thử kết nối lại tới known peer {} ({})", peer_id, addr);
+                                info!("🔄 Đang thử kết nối lại tới known peer {} ({})", peer_id, addr);
                                 let _ = self.swarm.dial(addr.clone());
                             }
                         }
@@ -440,16 +521,11 @@ impl P2PEventLoop {
                     .connected_peers
                     .iter()
                     .cloned()
-                    .filter(|p| !self.reserved_relays.contains(p))
+                    .filter(|p| !self.reserved_relays.contains(p) && !self.discovered_relays.contains(p))
                     .collect();
 
-                let connected_targets = if storage_peers.is_empty() {
-                    self.connected_peers.iter().cloned().collect::<Vec<_>>()
-                } else {
-                    storage_peers
-                };
-
-                if connected_targets.is_empty() {
+                if storage_peers.is_empty() {
+                    warn!("⚠️ Chưa có Storage Peer nào kết nối (chỉ có Relay). Đang chờ kết nối...");
                     let _ = respond_to.send(Err(NetworkError::NoPeersAvailable));
                     return;
                 }
@@ -474,7 +550,7 @@ impl P2PEventLoop {
                 );
 
                 for hash in remaining_hashes {
-                    for peer in &connected_targets {
+                    for peer in &storage_peers {
                         let req = ShardRequest::Pull(PullShard { hash: hash.clone() });
                         let req_id = self
                             .swarm
@@ -515,23 +591,33 @@ impl P2PEventLoop {
                             .insert(address.clone());
                     }
 
-                    // Khi đã kết nối thành công tới peer, nếu peer này có thể là Relay và chưa tạo reservation:
-                    if !self.reserved_relays.contains(&peer_id) {
-                        let addr_str = address.to_string();
-                        let is_potential_relay = addr_str.contains("ngrok")
-                            || addr_str.contains("relay")
-                            || addr_str.contains("/dns")
-                            || addr_str.contains("/tcp/4002");
+                    // Khi đã kết nối thành công tới peer, nếu peer này là Relay và chưa tạo reservation:
+                    let addr_str = address.to_string();
+                    let is_potential_relay = self.discovered_relays.contains(&peer_id)
+                        || addr_str.contains("ngrok")
+                        || addr_str.contains("relay")
+                        || addr_str.contains("/dns")
+                        || addr_str.contains("/tcp/4002");
 
-                        if is_potential_relay {
-                            let circuit_addr = address.with(libp2p::multiaddr::Protocol::P2pCircuit);
-                            debug!("Đang đăng ký Relay Circuit Reservation tại: {}", circuit_addr);
+                    if is_potential_relay {
+                        let relay_addr_base = if let Some(addrs) = self.known_peer_addrs.get(&peer_id) {
+                            addrs.iter().find(|a| !a.to_string().contains("/p2p-circuit/")).cloned().unwrap_or_else(|| address.clone())
+                        } else {
+                            address.clone()
+                        };
+                        let relay_with_id = ensure_relay_peer_id(relay_addr_base, &peer_id);
+                        self.known_relays.insert(relay_with_id.clone());
+
+                        if !self.reserved_relays.contains(&peer_id) {
+                            let circuit_addr = relay_with_id.clone().with(libp2p::multiaddr::Protocol::P2pCircuit);
+
+                            info!("🔗 Đang đăng ký Relay Circuit Reservation tại: {}", circuit_addr);
                             match self.swarm.listen_on(circuit_addr) {
                                 Ok(_) => {
                                     self.reserved_relays.insert(peer_id);
                                 }
                                 Err(e) => {
-                                    debug!("Không thể đăng ký Circuit Reservation trên {}: {}", peer_id, e);
+                                    warn!("❌ Không thể đăng ký Circuit Reservation trên {}: {}", peer_id, e);
                                 }
                             }
                         }
@@ -541,7 +627,7 @@ impl P2PEventLoop {
             SwarmEvent::OutgoingConnectionError {
                 peer_id, error, ..
             } => {
-                debug!("❌ Lỗi kết nối Outbound tới peer {:?}: {}", peer_id, error);
+                warn!("⚠️ [LỖI KẾT NỐI OUTBOUND] Không thể kết nối tới peer {:?}: {}", peer_id, error);
             }
             SwarmEvent::IncomingConnectionError {
                 send_back_addr,
@@ -551,10 +637,12 @@ impl P2PEventLoop {
                 debug!("❌ Lỗi kết nối Inbound từ {}: {}", send_back_addr, error);
             }
             SwarmEvent::Dialing { peer_id, .. } => {
-                debug!("📞 Đang thực hiện dial tới peer: {:?}", peer_id);
+                if let Some(pid) = peer_id {
+                    info!("📞 Đang thực hiện dial tới peer: {}", pid);
+                }
             }
             SwarmEvent::ConnectionClosed { peer_id, .. } => {
-                debug!("Ngắt kết nối với peer: {}", peer_id);
+                info!("Ngắt kết nối với peer: {}", peer_id);
                 self.connected_peers.remove(&peer_id);
                 self.reserved_relays.remove(&peer_id);
             }
@@ -581,11 +669,6 @@ impl P2PEventLoop {
                     trace!("Nhận thông tin Identify từ {}: {:?}", peer_id, info.listen_addrs);
                     for addr in info.listen_addrs {
                         if is_dialable_multiaddr(&addr) {
-                            let s = addr.to_string();
-                            // Không nạp loopback từ identify của remote peer
-                            if s.contains("/ip4/127.0.0.1/") || s.contains("/ip6/::1/") {
-                                continue;
-                            }
                             self.swarm
                                 .behaviour_mut()
                                 .kademlia
@@ -602,6 +685,57 @@ impl P2PEventLoop {
                 let addr_str = address.to_string();
                 if addr_str.contains("/p2p-circuit/") || addr_str.contains("/p2p-circuit") {
                     info!("🎉 Đã đăng ký thành công Relay Circuit: {}", address);
+
+                    // 1. EVENT-DRIVEN IMMEDIATE HEARTBEAT: Bắn heartbeat ngay lập tức khi vừa có Circuit address!
+                    if let Some((client, direct_addr, region)) = &self.rendezvous_info {
+                        let client = client.clone();
+                        let peer_id_str = self.local_peer_id.to_string();
+                        let mut addrs = vec![direct_addr.to_string()];
+
+                        for l in self.swarm.listeners() {
+                            let s = l.to_string();
+                            if s.contains("/p2p-circuit") {
+                                let formatted = if s.ends_with(&peer_id_str) {
+                                    s
+                                } else {
+                                    format!("{}/p2p/{}", s.trim_end_matches('/'), peer_id_str)
+                                };
+                                if !addrs.contains(&formatted) {
+                                    addrs.push(formatted);
+                                }
+                            }
+                        }
+
+                        let region = region.clone();
+                        tokio::spawn(async move {
+                            debug!("⚡ Bắn Heartbeat tức thì lên Rendezvous với multiaddrs: {:?}", addrs);
+                            let _ = client.send_heartbeat(&peer_id_str, &addrs, region).await;
+                        });
+                    }
+
+                    // 2. KHI ĐÃ CÓ RESERVATION XÁC NHẬN: Nối cầu Circuit tới các Storage Peers!
+                    for relay_addr in &self.known_relays {
+                        if let Some(relay_id) = extract_peer_id(relay_addr) {
+                            let relay_with_id = ensure_relay_peer_id(relay_addr.clone(), &relay_id);
+                            for (known_peer, addrs) in &mut self.known_peer_addrs {
+                                if *known_peer != self.local_peer_id && *known_peer != relay_id && !self.connected_peers.contains(known_peer) {
+                                    let inferred_circuit = relay_with_id
+                                        .clone()
+                                        .with(libp2p::multiaddr::Protocol::P2pCircuit)
+                                        .with(libp2p::multiaddr::Protocol::P2p(*known_peer));
+
+                                    addrs.insert(inferred_circuit.clone());
+                                    self.swarm
+                                        .behaviour_mut()
+                                        .kademlia
+                                        .add_address(known_peer, inferred_circuit.clone());
+
+                                    info!("⚡ Nối cầu Circuit tới Storage Peer: {} ({})", known_peer, inferred_circuit);
+                                    let _ = self.swarm.dial(inferred_circuit);
+                                }
+                            }
+                        }
+                    }
                 } else {
                     info!("Node đang lắng nghe tại Multiaddr: {}", address);
                 }
@@ -763,10 +897,15 @@ impl P2PEventLoop {
 
 fn is_dialable_multiaddr(addr: &Multiaddr) -> bool {
     let s = addr.to_string();
-    if s.contains("/ip6/fe80:") {
+    if s.contains("/ip6/fe80:") || s.contains("/ip4/0.0.0.0/") || s.contains("/ip6/::/") {
         return false;
     }
-    if s.contains("/ip4/0.0.0.0/") || s.contains("/ip6/::/") {
+    // Không bao giờ dial 127.0.0.1 qua đường Circuit Relay
+    if (s.contains("/ip4/127.0.0.1/") || s.contains("/ip6/::1/")) && s.contains("/p2p-circuit/") {
+        return false;
+    }
+    // Bỏ qua địa chỉ trần chỉ có /p2p/<PeerID> mà thiếu transport (ip/dns/circuit)
+    if !s.contains("/ip4/") && !s.contains("/ip6/") && !s.contains("/dns4/") && !s.contains("/dns6/") && !s.contains("/dns/") {
         return false;
     }
     true
@@ -780,4 +919,12 @@ fn extract_peer_id(addr: &Multiaddr) -> Option<PeerId> {
         }
     }
     last
+}
+
+fn ensure_relay_peer_id(mut addr: Multiaddr, relay_id: &PeerId) -> Multiaddr {
+    let s = addr.to_string();
+    if !s.contains(&relay_id.to_string()) {
+        addr.push(libp2p::multiaddr::Protocol::P2p(*relay_id));
+    }
+    addr
 }

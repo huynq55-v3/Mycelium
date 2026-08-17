@@ -348,8 +348,8 @@ impl IpcServer {
             )
             .await?;
 
-            // Đợi tối đa 4 giây cho tới khi có ít nhất 2 peers (Relay + Storage node) kết nối
-            for _ in 0..20 {
+            // Đợi tối đa 6 giây cho tới khi có ít nhất 2 peers (Relay + Storage node) kết nối
+            for _ in 0..30 {
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 connected = self.service.get_connected_peers().await.unwrap_or_default();
                 if connected.len() >= 2 {

@@ -53,8 +53,8 @@ pub fn build_transport(
             .authenticate(noise_config)
             .multiplex(yamux_config);
 
-        // Đặt upgraded_tcp làm nhánh ưu tiên hàng đầu (Left) để xử lý mọi kết nối TCP trực tiếp
-        let transport = OrTransport::new(upgraded_tcp, upgraded_relay)
+        // Đặt upgraded_relay làm nhánh ưu tiên hàng đầu (Left) để mọi địa chỉ chứa /p2p-circuit/ được Relay Transport xử lý chính xác
+        let transport = OrTransport::new(upgraded_relay, upgraded_tcp)
             .map(|either_output, _| match either_output {
                 futures::future::Either::Left((peer_id, muxer)) => (peer_id, StreamMuxerBox::new(muxer)),
                 futures::future::Either::Right((peer_id, muxer)) => (peer_id, StreamMuxerBox::new(muxer)),
@@ -68,7 +68,7 @@ pub fn build_transport(
             .authenticate(noise_config)
             .multiplex(yamux_config);
 
-        let transport = OrTransport::new(upgraded_tcp, upgraded_relay)
+        let transport = OrTransport::new(upgraded_relay, upgraded_tcp)
             .map(|either_output, _| match either_output {
                 futures::future::Either::Left((peer_id, muxer)) => (peer_id, StreamMuxerBox::new(muxer)),
                 futures::future::Either::Right((peer_id, muxer)) => (peer_id, StreamMuxerBox::new(muxer)),
