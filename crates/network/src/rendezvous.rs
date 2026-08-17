@@ -9,7 +9,7 @@ use tracing::{debug, info, warn};
 use crate::error::NetworkError;
 
 const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_secs(5);
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10 * 60); // 10 phút
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30); // 30 giây
 
 /// Payload gửi lên Rendezvous Server qua endpoint `/heartbeat`.
 #[derive(Debug, Serialize, Deserialize)]
@@ -133,7 +133,7 @@ impl RendezvousClient {
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
             info!(
-                "Đã khởi động heartbeat loop tới {} (chu kỳ 10 phút)",
+                "Đã khởi động heartbeat loop tới {} (chu kỳ 30 giây)",
                 client.endpoint_url
             );
 
@@ -153,8 +153,8 @@ impl RendezvousClient {
                     }
                     Err(err) => {
                         warn!(
-                            "Gặp sự cố khi gửi heartbeat tới Rendezvous: {}",
-                            err
+                            "Gặp sự cố khi gửi heartbeat tới Rendezvous ({}): {}. Sẽ thử lại sau 30 giây.",
+                            client.endpoint_url, err
                         );
                     }
                 }

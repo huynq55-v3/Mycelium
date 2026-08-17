@@ -17,7 +17,7 @@ interface HeartbeatPayload {
   region?: string;
 }
 
-const PEER_TTL_MS = 15 * 60 * 1000; // 15 phút TTL
+const PEER_TTL_MS = 2 * 60 * 1000; // 2 phút TTL (gấp 4 lần chu kỳ Heartbeat 30s)
 const DEFAULT_LIMIT = 20;
 const MAX_LIMIT = 100;
 
