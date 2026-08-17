@@ -13,8 +13,8 @@ use libp2p::{dns, noise, tcp, yamux, PeerId, Transport};
 use crate::error::NetworkError;
 
 /// Xây dựng Transport chuẩn mực cho node P2P Mycelium:
-/// - **Direct DNS + TCP**: Đi qua PNet (SwarmKey) -> Noise Protocol (Ed25519) -> Yamux Multiplexer.
-/// - **Circuit Relay v2 Client**: Đi qua Noise Protocol (Ed25519) -> Yamux Multiplexer.
+/// - **Ưu tiên 1 (Left - Direct TCP)**: Direct TCP / DNS qua PNet -> Noise -> Yamux.
+/// - **Ưu tiên 2 (Right - Relay Circuit)**: Circuit Relay v2 Client qua Noise -> Yamux.
 pub fn build_transport(
     keypair: &Keypair,
     swarm_key: Option<&SwarmKey>,
@@ -27,7 +27,7 @@ pub fn build_transport(
         .map_err(|e| NetworkError::TransportError(format!("Lỗi cấu hình Noise: {e}")))?;
     let yamux_config = yamux::Config::default();
 
-    // 2. Nâng cấp Relay Transport độc lập
+    // 2. Nâng cấp Relay Circuit Transport độc lập
     let upgraded_relay = relay_transport
         .upgrade(Version::V1Lazy)
         .authenticate(noise_config.clone())
@@ -53,8 +53,8 @@ pub fn build_transport(
             .authenticate(noise_config)
             .multiplex(yamux_config);
 
-        // Ghép nối 2 luồng đã được nâng cấp hoàn chỉnh
-        let transport = OrTransport::new(upgraded_relay, upgraded_tcp)
+        // Đặt upgraded_tcp làm nhánh ưu tiên hàng đầu (Left) để xử lý mọi kết nối TCP trực tiếp
+        let transport = OrTransport::new(upgraded_tcp, upgraded_relay)
             .map(|either_output, _| match either_output {
                 futures::future::Either::Left((peer_id, muxer)) => (peer_id, StreamMuxerBox::new(muxer)),
                 futures::future::Either::Right((peer_id, muxer)) => (peer_id, StreamMuxerBox::new(muxer)),
@@ -68,7 +68,7 @@ pub fn build_transport(
             .authenticate(noise_config)
             .multiplex(yamux_config);
 
-        let transport = OrTransport::new(upgraded_relay, upgraded_tcp)
+        let transport = OrTransport::new(upgraded_tcp, upgraded_relay)
             .map(|either_output, _| match either_output {
                 futures::future::Either::Left((peer_id, muxer)) => (peer_id, StreamMuxerBox::new(muxer)),
                 futures::future::Either::Right((peer_id, muxer)) => (peer_id, StreamMuxerBox::new(muxer)),
