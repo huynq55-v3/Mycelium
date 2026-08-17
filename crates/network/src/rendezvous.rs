@@ -15,7 +15,7 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10 * 60); // 10 phút
 #[derive(Debug, Serialize, Deserialize)]
 pub struct HeartbeatRequest {
     pub peer_id: String,
-    pub multiaddr: String,
+    pub multiaddrs: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub region: Option<String>,
 }
@@ -53,9 +53,6 @@ impl RendezvousClient {
     }
 
     /// Lấy danh sách các active peer multiaddr từ Rendezvous server (cold-start bootstrap).
-    ///
-    /// Nếu có lỗi kết nối (mạng chập chờn, server timeout), hàm tự động log warning
-    /// và trả về `Ok(vec![])` để node tiếp tục hoạt động dựa trên mDNS / local cache.
     pub async fn fetch_bootstrap_peers(&self, limit: usize) -> Result<Vec<Multiaddr>, NetworkError> {
         let url = format!("{}/peers?limit={}", self.endpoint_url, limit);
         debug!("Đang truy vấn bootstrap peers từ Rendezvous: {}", url);
@@ -104,17 +101,17 @@ impl RendezvousClient {
         Ok(multiaddrs)
     }
 
-    /// Gửi một heartbeat đơn lẻ lên server.
+    /// Gửi heartbeat danh sách multiaddr lên server.
     pub async fn send_heartbeat(
         &self,
         peer_id: &str,
-        multiaddr: &str,
+        multiaddrs: &[String],
         region: Option<String>,
     ) -> Result<bool, NetworkError> {
         let url = format!("{}/heartbeat", self.endpoint_url);
         let body = HeartbeatRequest {
             peer_id: peer_id.to_string(),
-            multiaddr: multiaddr.to_string(),
+            multiaddrs: multiaddrs.to_vec(),
             region,
         };
 
@@ -122,9 +119,7 @@ impl RendezvousClient {
         Ok(res.status().is_success())
     }
 
-    /// Khởi chạy vòng lặp gửi heartbeat định kỳ (10 phút một lần) dưới dạng Tokio background task.
-    ///
-    /// Tự động bắt lỗi im lặng và ghi log cảnh báo, không làm gián đoạn hay crash tiến trình chính.
+    /// Khởi chạy vòng lặp gửi heartbeat đơn giản định kỳ.
     pub fn start_heartbeat_loop(
         &self,
         local_peer_id: PeerId,
@@ -133,7 +128,7 @@ impl RendezvousClient {
     ) -> tokio::task::JoinHandle<()> {
         let client = self.clone();
         let peer_id_str = local_peer_id.to_string();
-        let multiaddr_str = public_multiaddr.to_string();
+        let addrs = vec![public_multiaddr.to_string()];
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
@@ -147,7 +142,7 @@ impl RendezvousClient {
 
                 debug!("Đang gửi heartbeat định kỳ tới Rendezvous...");
                 match client
-                    .send_heartbeat(&peer_id_str, &multiaddr_str, region.clone())
+                    .send_heartbeat(&peer_id_str, &addrs, region.clone())
                     .await
                 {
                     Ok(true) => {
@@ -158,8 +153,68 @@ impl RendezvousClient {
                     }
                     Err(err) => {
                         warn!(
-                            "Gặp sự cố khi gửi heartbeat tới Rendezvous ({}): {}. Sẽ thử lại sau 10 phút.",
-                            client.endpoint_url, err
+                            "Gặp sự cố khi gửi heartbeat tới Rendezvous: {}",
+                            err
+                        );
+                    }
+                }
+            }
+        })
+    }
+
+    /// Khởi chạy vòng lặp gửi heartbeat định kỳ, tự động gửi cả Direct IP và Relay Circuit addresses.
+    pub fn start_dynamic_heartbeat_loop(
+        &self,
+        service: crate::service::P2PService,
+        direct_multiaddr: Multiaddr,
+        region: Option<String>,
+    ) -> tokio::task::JoinHandle<()> {
+        let client = self.clone();
+        let local_peer_id = service.local_peer_id();
+        let peer_id_str = local_peer_id.to_string();
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            info!(
+                "Đã khởi động Dynamic Heartbeat Loop tới {} (chu kỳ 30s)",
+                client.endpoint_url
+            );
+
+            loop {
+                interval.tick().await;
+
+                let listeners = service.get_listeners().await.unwrap_or_default();
+                let mut addrs = vec![direct_multiaddr.to_string()];
+
+                for l in listeners {
+                    let s = l.to_string();
+                    if s.contains("/p2p-circuit/") || s.contains("/p2p-circuit") {
+                        let formatted = if s.ends_with(&peer_id_str) {
+                            s
+                        } else {
+                            format!("{}/p2p/{}", s.trim_end_matches('/'), peer_id_str)
+                        };
+                        if !addrs.contains(&formatted) {
+                            addrs.push(formatted);
+                        }
+                    }
+                }
+
+                debug!("Đang gửi heartbeat tới Rendezvous với multiaddrs: {:?}", addrs);
+                match client
+                    .send_heartbeat(&peer_id_str, &addrs, region.clone())
+                    .await
+                {
+                    Ok(true) => {
+                        debug!("Gửi heartbeat thành công cho node {}", peer_id_str);
+                    }
+                    Ok(false) => {
+                        warn!("Rendezvous server từ chối heartbeat cho node {}", peer_id_str);
+                    }
+                    Err(err) => {
+                        warn!(
+                            "Gặp sự cố khi gửi heartbeat tới Rendezvous: {}",
+                            err
                         );
                     }
                 }

@@ -5,19 +5,20 @@
 
 interface PeerRecord {
   peer_id: string;
-  multiaddr: string;
+  multiaddrs: string[];
   region: string;
   last_seen: number;
 }
 
 interface HeartbeatPayload {
   peer_id: string;
-  multiaddr: string;
+  multiaddr?: string;
+  multiaddrs?: string[];
   region?: string;
 }
 
 const PEER_TTL_MS = 15 * 60 * 1000; // 15 phút TTL
-const DEFAULT_LIMIT = 10;
+const DEFAULT_LIMIT = 20;
 const MAX_LIMIT = 100;
 
 const CORS_HEADERS: Record<string, string> = {
@@ -150,19 +151,29 @@ Deno.serve(async (req: Request, info: Deno.ServeHandlerInfo): Promise<Response> 
         return jsonResponse({ error: "Missing or invalid 'peer_id'" }, 400);
       }
 
-      if (!isValidMultiaddr(payload.multiaddr)) {
+      let rawAddrs: string[] = [];
+      if (Array.isArray(payload.multiaddrs) && payload.multiaddrs.length > 0) {
+        rawAddrs = payload.multiaddrs;
+      } else if (payload.multiaddr) {
+        rawAddrs = [payload.multiaddr];
+      }
+
+      rawAddrs = rawAddrs.filter(isValidMultiaddr);
+      if (rawAddrs.length === 0) {
         return jsonResponse(
           {
             error:
-              "Invalid multiaddr format. Must start with /ip4/, /ip6/, or /dns/ and contain /p2p/<peer_id>",
+              "No valid multiaddrs provided. Must start with /ip4/, /ip6/, or /dns/ and contain /p2p/<peer_id>",
           },
           400
         );
       }
 
-      // Phát hiện IP Public và tự động thay thế
+      // Phát hiện IP Public và tự động thay thế cho các địa chỉ 127.0.0.1/0.0.0.0
       const clientPublicIp = extractClientPublicIp(req, info);
-      const resolvedMultiaddr = resolveMultiaddrWithPublicIp(payload.multiaddr, clientPublicIp);
+      const resolvedMultiaddrs = Array.from(
+        new Set(rawAddrs.map((a) => resolveMultiaddrWithPublicIp(a, clientPublicIp)))
+      );
 
       const geoRegion =
         req.headers.get("cf-ipcountry") ||
@@ -172,7 +183,7 @@ Deno.serve(async (req: Request, info: Deno.ServeHandlerInfo): Promise<Response> 
 
       const record: PeerRecord = {
         peer_id: payload.peer_id,
-        multiaddr: resolvedMultiaddr,
+        multiaddrs: resolvedMultiaddrs,
         region: geoRegion.toUpperCase(),
         last_seen: Date.now(),
       };
@@ -184,7 +195,7 @@ Deno.serve(async (req: Request, info: Deno.ServeHandlerInfo): Promise<Response> 
       return jsonResponse({
         status: "registered",
         peer_id: record.peer_id,
-        multiaddr: record.multiaddr,
+        multiaddrs: record.multiaddrs,
         detected_public_ip: clientPublicIp,
         region: record.region,
         expires_in_seconds: PEER_TTL_MS / 1000,
@@ -210,25 +221,20 @@ Deno.serve(async (req: Request, info: Deno.ServeHandlerInfo): Promise<Response> 
 
     const activePeers = await getActivePeers();
 
-    const foreignPeers: PeerRecord[] = [];
-    const localPeers: PeerRecord[] = [];
-
+    const allMultiaddrs: string[] = [];
     for (const p of activePeers) {
-      if (p.region !== clientRegion && clientRegion !== "GLOBAL") {
-        foreignPeers.push(p);
-      } else {
-        localPeers.push(p);
+      if (Array.isArray(p.multiaddrs)) {
+        allMultiaddrs.push(...p.multiaddrs);
+      } else if ((p as any).multiaddr) {
+        allMultiaddrs.push((p as any).multiaddr);
       }
     }
 
-    const shuffledForeign = shuffleArray(foreignPeers);
-    const shuffledLocal = shuffleArray(localPeers);
-
-    const merged = [...shuffledForeign, ...shuffledLocal];
-    const selected = merged.slice(0, limit);
+    const uniqueAddrs = Array.from(new Set(allMultiaddrs));
+    const selected = uniqueAddrs.slice(0, limit);
 
     return jsonResponse({
-      peers: selected.map((p) => p.multiaddr),
+      peers: selected,
       total_active: activePeers.length,
       returned: selected.length,
       client_region: clientRegion,

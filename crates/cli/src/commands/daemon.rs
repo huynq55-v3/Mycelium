@@ -130,9 +130,9 @@ pub async fn handle_daemon(
 
     let public_multiaddr: Multiaddr = format!("/{}/{}/tcp/{}/p2p/{}", proto_prefix, resolved_ip, port, service.local_peer_id()).parse()?;
     
-    // Heartbeat định kỳ 10 phút
-    let _heartbeat_handle = rendezvous.start_heartbeat_loop(
-        service.local_peer_id(),
+    // Heartbeat định kỳ và cập nhật linh hoạt Circuit Relay multiaddr
+    let _heartbeat_handle = rendezvous.start_dynamic_heartbeat_loop(
+        service.clone(),
         public_multiaddr,
         Some("VN".to_string()),
     );

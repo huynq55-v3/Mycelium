@@ -331,24 +331,31 @@ impl IpcServer {
             }
         };
 
-        // 1. Tự động kiểm tra và kết nối nhanh tới các peer từ Rendezvous nếu chưa có peer
-        let connected = self.service.get_connected_peers().await.unwrap_or_default();
-        if connected.is_empty() {
+        // 1. Tự động kiểm tra và kết nối nhanh tới các peer từ Rendezvous
+        let rendezvous = RendezvousClient::new(&self.config.rendezvous_url);
+        let _ = self.service.bootstrap_from_rendezvous(&rendezvous, 20).await;
+
+        let mut connected = self.service.get_connected_peers().await.unwrap_or_default();
+        if connected.len() < 2 {
             Self::send_response(
                 writer,
                 &IpcResponse::Progress {
                     step: "connecting_peers".to_string(),
                     current: 5,
                     total: 100,
-                    message: "Đang đồng bộ và mở kết nối 2 chiều tới các peer từ Rendezvous...".to_string(),
+                    message: "Đang đồng bộ và mở kết nối 2 chiều tới các peer qua Relay...".to_string(),
                 },
             )
             .await?;
 
-            let rendezvous = RendezvousClient::new(&self.config.rendezvous_url);
-            let _ = self.service.bootstrap_from_rendezvous(&rendezvous, 20).await;
-            // Đợi 2.5 giây để tiến trình dial kết nối thành công
-            tokio::time::sleep(Duration::from_millis(2500)).await;
+            // Đợi tối đa 4 giây cho tới khi có ít nhất 2 peers (Relay + Storage node) kết nối
+            for _ in 0..20 {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                connected = self.service.get_connected_peers().await.unwrap_or_default();
+                if connected.len() >= 2 {
+                    break;
+                }
+            }
         }
 
         // 2. Gom song song 10 shards từ DHT

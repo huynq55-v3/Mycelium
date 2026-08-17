@@ -167,16 +167,21 @@ pub async fn handle_relay(
         None => detect_public_or_lan_ip().await,
     };
 
-    let public_multiaddr: Multiaddr = if host_or_ip.contains('.') && host_or_ip.chars().any(|c| c.is_alphabetic()) {
+    let public_transport_addr: Multiaddr = if host_or_ip.contains('.') && host_or_ip.chars().any(|c| c.is_alphabetic()) {
         // Domain name (ngrok / custom domain) -> Dùng dns4
-        format!("/dns4/{}/tcp/{}/p2p/{}", host_or_ip, public_port, local_peer_id).parse()?
+        format!("/dns4/{}/tcp/{}", host_or_ip, public_port).parse()?
     } else if host_or_ip.contains(':') {
         // IPv6
-        format!("/ip6/{}/tcp/{}/p2p/{}", host_or_ip, public_port, local_peer_id).parse()?
+        format!("/ip6/{}/tcp/{}", host_or_ip, public_port).parse()?
     } else {
         // IPv4
-        format!("/ip4/{}/tcp/{}/p2p/{}", host_or_ip, public_port, local_peer_id).parse()?
+        format!("/ip4/{}/tcp/{}", host_or_ip, public_port).parse()?
     };
+
+    // Công bố địa chỉ public cho Swarm để libp2p Identify truyền tới các peer
+    swarm.add_external_address(public_transport_addr.clone());
+
+    let public_multiaddr: Multiaddr = format!("{}/p2p/{}", public_transport_addr, local_peer_id).parse()?;
 
     println!("🌐 Địa chỉ công bố ra ngoài: \x1b[1;32m{}:{}\x1b[0m", host_or_ip, public_port);
 
@@ -186,7 +191,7 @@ pub async fn handle_relay(
     let _heartbeat_handle = rendezvous.start_heartbeat_loop(
         local_peer_id,
         public_multiaddr.clone(),
-        Some("RELAY-VN".to_string()),
+        Some("RELAY".to_string()),
     );
 
     println!("📡 Multiaddr đăng ký: \x1b[1;33m{}\x1b[0m", public_multiaddr);
