@@ -467,6 +467,7 @@ dependencies = [
  "core-crypto",
  "dirs",
  "erasure-codec",
+ "futures",
  "hex",
  "indicatif",
  "libp2p",
