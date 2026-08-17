@@ -12,12 +12,9 @@ use libp2p::{dns, noise, tcp, yamux, PeerId, Transport};
 
 use crate::error::NetworkError;
 
-/// Xây dựng Transport hoàn chỉnh cho node P2P Mycelium:
-/// - **DNS + Direct TCP Transport**: Hỗ trợ phân giải tên miền (ngrok / domain) và TCP socket trực tiếp.
-/// - **Circuit Relay v2 Client Transport**: Tự động chuyển tiếp qua Relay khi bị chặn bởi NAT/Firewall.
-/// - **Private Swarm (libp2p-pnet)**: Bảo vệ mạng riêng bằng `SwarmKey` 32-byte.
-/// - **Noise Protocol**: Mã hóa và xác thực chữ ký Ed25519.
-/// - **Yamux**: Ghép kênh kết nối (Multiplexing).
+/// Xây dựng Transport chuẩn mực cho node P2P Mycelium:
+/// - **Direct DNS + TCP**: Đi qua PNet (SwarmKey) -> Noise Protocol (Ed25519) -> Yamux Multiplexer.
+/// - **Circuit Relay v2 Client**: Đi qua Noise Protocol (Ed25519) -> Yamux Multiplexer.
 pub fn build_transport(
     keypair: &Keypair,
     swarm_key: Option<&SwarmKey>,
@@ -25,37 +22,57 @@ pub fn build_transport(
     let local_peer_id = keypair.public().to_peer_id();
     let (relay_transport, relay_behaviour) = client::new(local_peer_id);
 
-    // DNS + TCP Transport
-    let tcp_transport = tcp::tokio::Transport::default();
-    let dns_tcp = dns::tokio::Transport::system(tcp_transport)
-        .map_err(|e| NetworkError::TransportError(format!("Lỗi khởi tạo DNS Transport: {e}")))?;
-
+    // 1. Cấu hình Noise & Yamux
     let noise_config = noise::Config::new(keypair)
         .map_err(|e| NetworkError::TransportError(format!("Lỗi cấu hình Noise: {e}")))?;
     let yamux_config = yamux::Config::default();
+
+    // 2. Nâng cấp Relay Transport độc lập
+    let upgraded_relay = relay_transport
+        .upgrade(Version::V1Lazy)
+        .authenticate(noise_config.clone())
+        .multiplex(yamux_config.clone());
+
+    // 3. DNS + Direct TCP Transport
+    let tcp_transport = tcp::tokio::Transport::default();
+    let dns_tcp = dns::tokio::Transport::system(tcp_transport)
+        .map_err(|e| NetworkError::TransportError(format!("Lỗi khởi tạo DNS Transport: {e}")))?;
 
     if let Some(sk) = swarm_key {
         let psk = PreSharedKey::new(*sk.as_bytes());
         let pnet_config = PnetConfig::new(psk);
 
-        let secured_base_tcp = dns_tcp.and_then(move |socket, _| {
-            pnet_config
-                .handshake(socket)
-                .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e))
-        });
-
-        let transport = OrTransport::new(relay_transport, secured_base_tcp)
+        // Nâng cấp Direct TCP với PNet + Noise + Yamux
+        let upgraded_tcp = dns_tcp
+            .and_then(move |socket, _| {
+                pnet_config
+                    .handshake(socket)
+                    .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e))
+            })
             .upgrade(Version::V1Lazy)
             .authenticate(noise_config)
-            .multiplex(yamux_config)
+            .multiplex(yamux_config);
+
+        // Ghép nối 2 luồng đã được nâng cấp hoàn chỉnh
+        let transport = OrTransport::new(upgraded_relay, upgraded_tcp)
+            .map(|either_output, _| match either_output {
+                futures::future::Either::Left((peer_id, muxer)) => (peer_id, StreamMuxerBox::new(muxer)),
+                futures::future::Either::Right((peer_id, muxer)) => (peer_id, StreamMuxerBox::new(muxer)),
+            })
             .boxed();
 
         Ok((transport, relay_behaviour))
     } else {
-        let transport = OrTransport::new(relay_transport, dns_tcp)
+        let upgraded_tcp = dns_tcp
             .upgrade(Version::V1Lazy)
             .authenticate(noise_config)
-            .multiplex(yamux_config)
+            .multiplex(yamux_config);
+
+        let transport = OrTransport::new(upgraded_relay, upgraded_tcp)
+            .map(|either_output, _| match either_output {
+                futures::future::Either::Left((peer_id, muxer)) => (peer_id, StreamMuxerBox::new(muxer)),
+                futures::future::Either::Right((peer_id, muxer)) => (peer_id, StreamMuxerBox::new(muxer)),
+            })
             .boxed();
 
         Ok((transport, relay_behaviour))
