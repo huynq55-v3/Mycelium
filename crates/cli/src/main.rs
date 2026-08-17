@@ -64,9 +64,13 @@ enum Commands {
 
     /// [DEDICATED RELAY MODE] Khởi chạy Circuit Relay v2 Server độc lập (Trạm trung chuyển vượt NAT - Zero Database)
     Relay {
-        /// Cổng TCP lắng nghe kết nối Relay (mặc định 4002)
+        /// Cổng TCP lắng nghe kết nối Relay trên máy (mặc định 4002)
         #[arg(short, long)]
         port: Option<u16>,
+
+        /// Cổng TCP công khai ra ngoài (nếu dùng ngrok / port-forwarding khác cổng nội bộ)
+        #[arg(long)]
+        public_port: Option<u16>,
 
         /// URL của Rendezvous / Bootstrap Server
         #[arg(short, long)]
@@ -136,11 +140,12 @@ async fn main() -> Result<()> {
         }
         Commands::Relay {
             port,
+            public_port,
             rendezvous_url,
             public_ip,
             swarm_key,
         } => {
-            commands::relay::handle_relay(port, rendezvous_url, public_ip, swarm_key).await?;
+            commands::relay::handle_relay(port, public_port, rendezvous_url, public_ip, swarm_key).await?;
         }
         Commands::Upload { file_path } => {
             commands::upload::handle_upload(file_path).await?;

@@ -62,11 +62,13 @@ async fn detect_public_or_lan_ip() -> String {
 
 pub async fn handle_relay(
     port_opt: Option<u16>,
+    public_port_opt: Option<u16>,
     rendezvous_url_opt: Option<String>,
     public_ip_opt: Option<String>,
     swarm_key_opt: Option<PathBuf>,
 ) -> Result<()> {
-    let port = port_opt.unwrap_or(DEFAULT_RELAY_PORT);
+    let listen_port = port_opt.unwrap_or(DEFAULT_RELAY_PORT);
+    let public_port = public_port_opt.unwrap_or(listen_port);
     let config = AppConfig::load_or_default();
     let rendezvous_url = rendezvous_url_opt.unwrap_or(config.rendezvous_url);
     let config_dir = AppConfig::config_dir()?;
@@ -149,36 +151,37 @@ pub async fn handle_relay(
         libp2p::swarm::Config::with_tokio_executor(),
     );
 
-    // 5. Lắng nghe Dual-Stack
-    let ipv4_addr: Multiaddr = format!("/ip4/0.0.0.0/tcp/{}", port).parse()?;
+    // 5. Lắng nghe Dual-Stack trên listen_port cục bộ
+    let ipv4_addr: Multiaddr = format!("/ip4/0.0.0.0/tcp/{}", listen_port).parse()?;
     swarm.listen_on(ipv4_addr.clone())?;
-    println!("👂 Relay Network: Đang lắng nghe tại \x1b[1;36m{}\x1b[0m", ipv4_addr);
+    println!("👂 Cổng lắng nghe nội bộ: \x1b[1;36m{}\x1b[0m", ipv4_addr);
 
-    let ipv6_addr: Multiaddr = format!("/ip6/::/tcp/{}", port).parse()?;
+    let ipv6_addr: Multiaddr = format!("/ip6/::/tcp/{}", listen_port).parse()?;
     if let Ok(_) = swarm.listen_on(ipv6_addr.clone()) {
         println!("🌐 IPv6 Dual-Stack: Đang lắng nghe tại \x1b[1;36m{}\x1b[0m", ipv6_addr);
     }
 
-    // 6. Phát hiện IP và gửi Heartbeat lên Rendezvous Server
+    // 6. Phát hiện IP và gửi Heartbeat lên Rendezvous Server (sử dụng public_port từ ngrok/router)
     let resolved_ip = match public_ip_opt {
         Some(ip) => ip,
         None => detect_public_or_lan_ip().await,
     };
     let is_v6 = resolved_ip.contains(':');
     let proto_prefix = if is_v6 { "ip6" } else { "ip4" };
-    println!("🌐 Địa chỉ IP công bố: \x1b[1;32m{}\x1b[0m (Cổng: {})", resolved_ip, port);
+    println!("🌐 Địa chỉ công bố ra ngoài: \x1b[1;32m{}:{}\x1b[0m ({})", resolved_ip, public_port, proto_prefix.to_uppercase());
 
     let rendezvous = RendezvousClient::new(&rendezvous_url);
     println!("📡 Rendezvous Server: \x1b[1;34m{}\x1b[0m", rendezvous_url);
 
-    let public_multiaddr: Multiaddr = format!("/{}/{}/tcp/{}/p2p/{}", proto_prefix, resolved_ip, port, local_peer_id).parse()?;
+    let public_multiaddr: Multiaddr = format!("/{}/{}/tcp/{}/p2p/{}", proto_prefix, resolved_ip, public_port, local_peer_id).parse()?;
     
     let _heartbeat_handle = rendezvous.start_heartbeat_loop(
         local_peer_id,
-        public_multiaddr,
+        public_multiaddr.clone(),
         Some("RELAY-VN".to_string()),
     );
 
+    println!("📡 Multiaddr đăng ký: \x1b[1;33m{}\x1b[0m", public_multiaddr);
     println!("============================================================");
     println!("✨ Relay Node đang hoạt động 24/7. Nhấn \x1b[1;31mCtrl+C\x1b[0m để dừng.");
     println!("============================================================");
