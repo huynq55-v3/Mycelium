@@ -25,29 +25,26 @@ pub fn build_transport(
     let local_peer_id = keypair.public().to_peer_id();
     let (relay_transport, relay_behaviour) = client::new(local_peer_id);
 
-    // DNS + TCP Transport cho phép kết nối cả IP và DNS tên miền (như 0.tcp.ap.ngrok.io)
+    // DNS + TCP Transport
     let tcp_transport = tcp::tokio::Transport::default();
-    let dns_tcp_transport = dns::tokio::Transport::system(tcp_transport)
+    let dns_tcp = dns::tokio::Transport::system(tcp_transport)
         .map_err(|e| NetworkError::TransportError(format!("Lỗi khởi tạo DNS Transport: {e}")))?;
 
-    // Áp dụng lớp bảo vệ Private Network (libp2p-pnet) nếu có SwarmKey
+    let noise_config = noise::Config::new(keypair)
+        .map_err(|e| NetworkError::TransportError(format!("Lỗi cấu hình Noise: {e}")))?;
+    let yamux_config = yamux::Config::default();
+
     if let Some(sk) = swarm_key {
         let psk = PreSharedKey::new(*sk.as_bytes());
         let pnet_config = PnetConfig::new(psk);
 
-        let noise_config = noise::Config::new(keypair)
-            .map_err(|e| NetworkError::TransportError(format!("Lỗi cấu hình Noise: {e}")))?;
-        let yamux_config = yamux::Config::default();
+        let secured_base_tcp = dns_tcp.and_then(move |socket, _| {
+            pnet_config
+                .handshake(socket)
+                .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e))
+        });
 
-        let secured_tcp = dns_tcp_transport
-            .and_then(move |socket, _| {
-                pnet_config
-                    .handshake(socket)
-                    .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e))
-            })
-            .boxed();
-
-        let transport = OrTransport::new(relay_transport, secured_tcp)
+        let transport = OrTransport::new(relay_transport, secured_base_tcp)
             .upgrade(Version::V1Lazy)
             .authenticate(noise_config)
             .multiplex(yamux_config)
@@ -55,11 +52,7 @@ pub fn build_transport(
 
         Ok((transport, relay_behaviour))
     } else {
-        let noise_config = noise::Config::new(keypair)
-            .map_err(|e| NetworkError::TransportError(format!("Lỗi cấu hình Noise: {e}")))?;
-        let yamux_config = yamux::Config::default();
-
-        let transport = OrTransport::new(relay_transport, dns_tcp_transport)
+        let transport = OrTransport::new(relay_transport, dns_tcp)
             .upgrade(Version::V1Lazy)
             .authenticate(noise_config)
             .multiplex(yamux_config)

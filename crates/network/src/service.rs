@@ -341,10 +341,6 @@ impl P2PEventLoop {
                             let _ = self.swarm.dial(addr.clone());
                         }
 
-                        // Tự động đăng ký Circuit Reservation nếu peer có thể là Relay
-                        let circuit_addr = addr.with(libp2p::multiaddr::Protocol::P2pCircuit);
-                        let _ = self.swarm.listen_on(circuit_addr);
-
                         added += 1;
                     }
                 }
@@ -478,8 +474,28 @@ impl P2PEventLoop {
                     self.known_peer_addrs
                         .entry(peer_id)
                         .or_default()
-                        .insert(address);
+                        .insert(address.clone());
+
+                    // Khi đã kết nối thành công tới peer (ví dụ Relay Node), đăng ký đường truyền Circuit Reservation
+                    let circuit_addr = address.with(libp2p::multiaddr::Protocol::P2pCircuit);
+                    debug!("Đang đăng ký Relay Circuit Reservation tại: {}", circuit_addr);
+                    let _ = self.swarm.listen_on(circuit_addr);
                 }
+            }
+            SwarmEvent::OutgoingConnectionError {
+                peer_id, error, ..
+            } => {
+                warn!("❌ Lỗi kết nối Outbound tới peer {:?}: {}", peer_id, error);
+            }
+            SwarmEvent::IncomingConnectionError {
+                send_back_addr,
+                error,
+                ..
+            } => {
+                warn!("❌ Lỗi kết nối Inbound từ {}: {}", send_back_addr, error);
+            }
+            SwarmEvent::Dialing { peer_id, .. } => {
+                debug!("📞 Đang thực hiện dial tới peer: {:?}", peer_id);
             }
             SwarmEvent::ConnectionClosed { peer_id, .. } => {
                 debug!("Ngắt kết nối với peer: {}", peer_id);
