@@ -128,6 +128,9 @@ impl IpcServer {
             IpcRequest::VfsDownload { vfs_path, output_path } => {
                 self.handle_vfs_download(vfs_path, output_path, &mut writer).await?;
             }
+            IpcRequest::Dump { private_key, output_dir, vfs_path } => {
+                self.handle_dump(private_key, output_dir, vfs_path, &mut writer).await?;
+            }
         }
 
         Ok(())
@@ -974,13 +977,232 @@ impl IpcServer {
         Ok(())
     }
 
+    async fn handle_dump<W: AsyncWriteExt + Unpin>(
+        &self,
+        private_key: String,
+        output_dir: String,
+        vfs_path: Option<String>,
+        writer: &mut W,
+    ) -> Result<()> {
+        // 1. Phục hồi Identity từ private_key (hex hoặc file)
+        let identity = if let Ok(id) = Identity::from_secret_hex(&private_key) {
+            id
+        } else if let Ok(id) = Identity::load_from_file(&PathBuf::from(&private_key)) {
+            id
+        } else {
+            Self::send_response(
+                writer,
+                &IpcResponse::Error("Khóa bí mật không hợp lệ (cần mã hex 64 ký tự hoặc đường dẫn file identity.json)".to_string()),
+            ).await?;
+            return Ok(());
+        };
+
+        // 2. Đọc file vfs_tree.enc
+        let tree_file = match vfs_path {
+            Some(p) => PathBuf::from(p),
+            None => {
+                if let Ok(dir) = AppConfig::config_dir() {
+                    dir.join("vfs_tree.enc")
+                } else {
+                    PathBuf::from("vfs_tree.enc")
+                }
+            }
+        };
+
+        if !tree_file.exists() {
+            Self::send_response(
+                writer,
+                &IpcResponse::Error(format!("Không tìm thấy file cây thư mục ảo tại {:?}", tree_file)),
+            ).await?;
+            return Ok(());
+        }
+
+        let encrypted_vfs_bytes = match fs::read(&tree_file) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                Self::send_response(
+                    writer,
+                    &IpcResponse::Error(format!("Không thể đọc file vfs_tree.enc: {e}")),
+                ).await?;
+                return Ok(());
+            }
+        };
+
+        // 3. Giải mã VirtualTree bằng Identity
+        let tree = match network::VirtualTree::decrypt_tree(&encrypted_vfs_bytes, &identity) {
+            Ok(t) => t,
+            Err(e) => {
+                Self::send_response(
+                    writer,
+                    &IpcResponse::Error(format!("Giải mã VirtualTree thất bại! Khóa bí mật không chính xác: {e}")),
+                ).await?;
+                return Ok(());
+            }
+        };
+
+        let files = tree.list_all_files();
+        if files.is_empty() {
+            Self::send_response(
+                writer,
+                &IpcResponse::Error("Cây thư mục ảo không chứa tệp tin nào để khôi phục".to_string()),
+            ).await?;
+            return Ok(());
+        }
+
+        let out_dir = PathBuf::from(&output_dir);
+        let _ = fs::create_dir_all(&out_dir);
+
+        let total_files = files.len();
+        let mut restored_count = 0;
+        let mut total_bytes = 0u64;
+
+        Self::send_response(
+            writer,
+            &IpcResponse::Progress {
+                step: "dump_start".to_string(),
+                current: 0,
+                total: total_files as u64,
+                message: format!("Bắt đầu khôi phục {} tệp tin cho DID {}...", total_files, identity.to_did()),
+            },
+        ).await?;
+
+        for (idx, (vfs_path, file_node)) in files.iter().enumerate() {
+            Self::send_response(
+                writer,
+                &IpcResponse::Progress {
+                    step: "dumping_file".to_string(),
+                    current: (idx + 1) as u64,
+                    total: total_files as u64,
+                    message: format!("({}/{}) Đang kéo shards và giải mã {} ({:.2} MB)...", idx + 1, total_files, vfs_path, file_node.size as f64 / (1024.0 * 1024.0)),
+                },
+            ).await?;
+
+            let collected_shards = match self
+                .service
+                .fetch_shards_parallel(file_node.shard_hashes.clone(), file_node.k_data_shards)
+                .await
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("Không thể kéo đủ shards cho file {}: {}", vfs_path, e);
+                    continue;
+                }
+            };
+
+            let manifest = erasure_codec::FileManifest {
+                file_name: file_node.name.clone(),
+                original_size: file_node.size as usize,
+                original_hash: String::new(),
+                k_data_shards: file_node.k_data_shards,
+                n_total_shards: file_node.n_total_shards,
+                shard_hashes: file_node.shard_hashes.clone(),
+            };
+
+            let mut sparse_shards = vec![None; file_node.n_total_shards];
+            for shard in collected_shards {
+                let s_idx = shard.index;
+                if s_idx < sparse_shards.len() {
+                    sparse_shards[s_idx] = Some(shard);
+                }
+            }
+
+            let recovered_encrypted_data = match decode(&manifest, sparse_shards) {
+                Ok(data) => data,
+                Err(e) => {
+                    warn!("Lỗi decode Reed-Solomon cho file {}: {}", vfs_path, e);
+                    continue;
+                }
+            };
+
+            let enc_key = match hex::decode(&file_node.encryption_key_hex) {
+                Ok(k) if k.len() == 32 => {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&k);
+                    arr
+                }
+                _ => {
+                    warn!("Khóa mã hóa file {} không hợp lệ", vfs_path);
+                    continue;
+                }
+            };
+
+            let decrypted_data = match decrypt_data(&recovered_encrypted_data, &enc_key) {
+                Ok(d) => d,
+                Err(e) => {
+                    warn!("Lỗi giải mã AES-GCM cho file {}: {}", vfs_path, e);
+                    continue;
+                }
+            };
+
+            let clean_rel_path = vfs_path.trim_start_matches('/');
+            let target_out = out_dir.join(clean_rel_path);
+
+            if let Some(parent) = target_out.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+
+            if let Ok(mut out_f) = File::create(&target_out) {
+                if out_f.write_all(&decrypted_data).is_ok() {
+                    let _ = out_f.flush();
+                    restored_count += 1;
+                    total_bytes += decrypted_data.len() as u64;
+                }
+            }
+        }
+
+        Self::send_response(
+            writer,
+            &IpcResponse::DumpSuccess {
+                restored_files_count: restored_count,
+                total_bytes,
+                output_dir,
+            },
+        ).await?;
+
+        Ok(())
+    }
+
     async fn handle_status<W: AsyncWriteExt + Unpin>(&self, writer: &mut W) -> Result<()> {
-        let qm = self.quota_manager.read().await;
+        let tree = self.load_vfs_tree();
+        let total_tree_size: u64 = tree.list_all_files().iter().map(|(_, f)| f.size).sum();
+        let total_blockstore_bytes = self.blockstore.total_payload_bytes().unwrap_or(0);
+
+        let mut qm = self.quota_manager.write().await;
+        let mut need_save = false;
+
+        // 1. Đồng bộ my_uploaded_bytes với VFS Tree
+        if total_tree_size == 0 {
+            if qm.my_uploaded_bytes > 0 {
+                qm.my_uploaded_bytes = 0;
+                need_save = true;
+            }
+        } else if qm.my_uploaded_bytes != total_tree_size {
+            qm.my_uploaded_bytes = total_tree_size;
+            need_save = true;
+        }
+
+        // 2. Đồng bộ stored_shard_bytes chính xác với BlockStore thực tế
+        if total_blockstore_bytes == 0 {
+            if qm.stored_shard_bytes > 0 {
+                qm.stored_shard_bytes = 0;
+                need_save = true;
+            }
+        } else if qm.stored_shard_bytes != total_blockstore_bytes {
+            qm.stored_shard_bytes = total_blockstore_bytes;
+            need_save = true;
+        }
+
+        if need_save {
+            if let Ok(p) = AppConfig::config_dir() {
+                let _ = qm.save_to_file(&p.join("quota.json"));
+            }
+        }
+
         let merit_mb = qm.my_uploaded_bytes as f64 / (1024.0 * 1024.0);
         let stored_shards_mb = qm.stored_shard_bytes as f64 / (1024.0 * 1024.0);
         let r_ratio = qm.current_r_ratio();
         let r_status = match r_ratio {
-            None => "⚡ Sẵn sàng cho First Atomic Commit (R = 4.0)".to_string(),
+            None => "⚡ Sẵn sàng cho First Atomic Commit (R = N/A)".to_string(),
             Some(r) if r < 4.0 => "🔴 Đang đói Shard (R < 4.0 - Cần nhận thêm Shard)".to_string(),
             Some(r) if r <= 5.0 => "🟢 Cân bằng lý tưởng (4.0 <= R <= 5.0 - Sẵn sàng Upload)".to_string(),
             Some(_) => "🟡 No nê / Chạm trần Cache (R > 5.0 - Tạm dừng nhận Cache)".to_string(),

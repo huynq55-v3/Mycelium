@@ -73,8 +73,8 @@ async fn test_two_nodes_p2p_direct_shard_transfer() {
     // Đợi kết nối P2P hoàn tất (khoảng 500ms)
     tokio::time::sleep(Duration::from_millis(600)).await;
 
-    // 3. Node 2 gửi 1 Shard tới Node 1
-    let sample_data = b"Sample P2P Reed-Solomon chunk data for Mycelium storage".to_vec();
+    // 3. Node 2 gửi 1 Shard 2MB tới Node 1
+    let sample_data = vec![0xABu8; 2 * 1024 * 1024]; // 2MB
     let sample_hash = erasure_codec::sha256_hex(&sample_data);
     let sample_shard = Shard {
         index: 0,
@@ -86,7 +86,7 @@ async fn test_two_nodes_p2p_direct_shard_transfer() {
     assert!(distribute_res.is_ok());
 
     // Đợi Node 1 nhận và lưu vào BlockStore
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
     // 4. Kiểm tra Node 1 đã nhận và lưu thành công shard vào BlockStore chưa
     let stored_in_node1 = store1.has_shard(&sample_hash).unwrap();

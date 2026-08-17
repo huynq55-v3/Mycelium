@@ -59,14 +59,10 @@ impl QuotaManager {
     }
 
     /// Tính toán chỉ số $R = \frac{\text{stored\_shard\_bytes}}{\text{my\_uploaded\_bytes}}$ hiện tại.
-    /// Trả về `None` (N/A) khi chưa có bất kỳ giao dịch nào (0 Merit, 0 Shard).
+    /// Trả về `None` (N/A) khi chưa upload file nào (0 Merit).
     pub fn current_r_ratio(&self) -> Option<f64> {
         if self.my_uploaded_bytes == 0 {
-            if self.stored_shard_bytes == 0 {
-                None // Chưa có giao dịch nào: N/A (Sẵn sàng cho First Atomic Commit)
-            } else {
-                Some(5.0) // Đã nhận shard mồi nhưng chưa upload -> Ở trần an toàn
-            }
+            None // Chưa upload file nào: N/A
         } else {
             Some(self.stored_shard_bytes as f64 / self.my_uploaded_bytes as f64)
         }

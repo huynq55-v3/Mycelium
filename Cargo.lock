@@ -2513,6 +2513,7 @@ dependencies = [
  "async-trait",
  "blockstore",
  "core-crypto",
+ "dirs",
  "erasure-codec",
  "futures",
  "hex",

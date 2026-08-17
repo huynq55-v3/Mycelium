@@ -51,6 +51,25 @@ impl BlockStore {
         Ok(())
     }
 
+    /// Lưu một shard nhị phân kèm mã định danh File (`file_cid`).
+    pub fn put_shard_with_file(&self, hash: &str, file_cid: &str, data: &[u8]) -> Result<(), BlockStoreError> {
+        self.db.insert(hash.as_bytes(), data)?;
+        let tree = self.db.open_tree("shard_to_file")?;
+        tree.insert(hash.as_bytes(), file_cid.as_bytes())?;
+        self.db.flush()?;
+        Ok(())
+    }
+
+    /// Lấy mã định danh File (`file_cid`) tương ứng với `shard_hash`.
+    pub fn get_file_cid_for_shard(&self, hash: &str) -> Result<Option<String>, BlockStoreError> {
+        let tree = self.db.open_tree("shard_to_file")?;
+        if let Some(val) = tree.get(hash.as_bytes())? {
+            Ok(Some(String::from_utf8_lossy(&val).to_string()))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Đọc dữ liệu shard từ kho lưu trữ theo `shard_hash`.
     ///
     /// # Arguments

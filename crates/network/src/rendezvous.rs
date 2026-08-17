@@ -203,6 +203,11 @@ impl RendezvousClient {
                     }
                 }
 
+                if addrs.is_empty() {
+                    debug!("Chưa có Relay Circuit nào được đăng ký, tạm hoãn gửi heartbeat lên Rendezvous");
+                    continue;
+                }
+
                 debug!("Đang gửi heartbeat tới Rendezvous với multiaddrs: {:?}", addrs);
                 match client
                     .send_heartbeat(&peer_id_str, &addrs, region.clone())

@@ -38,6 +38,12 @@ pub enum IpcRequest {
         vfs_path: String,
         output_path: Option<String>,
     },
+    /// Yêu cầu khôi phục / dump toàn bộ dữ liệu người dùng từ Private Key
+    Dump {
+        private_key: String,
+        output_dir: String,
+        vfs_path: Option<String>,
+    },
 }
 
 /// Thông tin trạng thái của P2P Daemon trả về cho client.
@@ -102,6 +108,12 @@ pub enum IpcResponse {
         path: String,
         freed_bytes: u64,
         r_ratio: Option<f64>,
+    },
+    /// Kết quả hoàn thành Dump toàn bộ dữ liệu
+    DumpSuccess {
+        restored_files_count: usize,
+        total_bytes: u64,
+        output_dir: String,
     },
     /// Kết quả truy vấn trạng thái
     StatusSuccess(DaemonStatusInfo),

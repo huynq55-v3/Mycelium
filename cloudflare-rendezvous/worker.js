@@ -32,7 +32,7 @@ export default {
       try {
         const body = await request.json();
         const peerId = body.peer_id || request.headers.get("X-Peer-Id");
-        let addresses = body.addresses || [];
+        let addresses = body.multiaddrs || body.addresses || [];
 
         if (!peerId) {
           return new Response(JSON.stringify({ error: "Missing peer_id" }), {
@@ -92,6 +92,21 @@ export default {
       const now = Date.now();
       const requestingPeerId = request.headers.get("X-Peer-Id") || url.searchParams.get("exclude");
       const limit = parseInt(url.searchParams.get("limit") || "20", 10);
+
+      // Đọc từ KV để đồng bộ toàn cầu giữa các Data Center
+      if (env && env.MYCELIUM_KV) {
+        try {
+          const list = await env.MYCELIUM_KV.list({ prefix: "peer:" });
+          for (const key of list.keys) {
+            const val = await env.MYCELIUM_KV.get(key.name, { type: "json" });
+            if (val && val.expires_at > now) {
+              peersStore.set(val.peer_id, val);
+            }
+          }
+        } catch (e) {
+          console.error("KV read error:", e);
+        }
+      }
 
       // Dọn dẹp các peer đã hết hạn
       for (const [id, record] of peersStore.entries()) {

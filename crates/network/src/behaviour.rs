@@ -7,12 +7,11 @@ use libp2p::kad::store::MemoryStore;
 use libp2p::kad::{self, Config as KadConfig};
 use libp2p::mdns::{self, Config as MdnsConfig};
 use libp2p::relay;
-use libp2p::request_response::cbor::Behaviour as CborReqResp;
-use libp2p::request_response::{Config as ReqRespConfig, ProtocolSupport};
+use libp2p::request_response::{Behaviour as ReqRespBehaviour, Config as ReqRespConfig, ProtocolSupport};
 use libp2p::swarm::NetworkBehaviour;
 use libp2p::StreamProtocol;
 
-use crate::protocol::{ShardRequest, ShardResponse};
+use crate::protocol::MyceliumStorageCodec;
 
 pub const MYCELIUM_STORAGE_PROTOCOL: StreamProtocol =
     StreamProtocol::new("/mycelium/storage/1.0.0");
@@ -30,8 +29,8 @@ pub struct MyceliumBehaviour {
     pub kademlia: kad::Behaviour<MemoryStore>,
     /// Khám phá các peer trong mạng LAN nội bộ bằng mDNS.
     pub mdns: mdns::tokio::Behaviour,
-    /// Giao thức Request-Response truyền nhận Shard (Push/Pull) sử dụng CBOR.
-    pub request_response: CborReqResp<ShardRequest, ShardResponse>,
+    /// Giao thức Request-Response truyền nhận Shard (Push/Pull/Prune) hỗ trợ payload tới 64MB.
+    pub request_response: ReqRespBehaviour<MyceliumStorageCodec>,
     /// Xác thực danh tính và thông tin của peer kết nối.
     pub identify: identify::Behaviour,
     /// Circuit Relay v2 Client (cho phép node đăng ký và chuyển tiếp qua Relay).
@@ -57,11 +56,11 @@ impl MyceliumBehaviour {
         // 2. Cấu hình mDNS (LAN discovery)
         let mdns = mdns::tokio::Behaviour::new(MdnsConfig::default(), local_peer_id)?;
 
-        // 3. Cấu hình Request-Response CBOR
+        // 3. Cấu hình Request-Response với Codec 64MB
         let req_resp_config = ReqRespConfig::default()
-            .with_request_timeout(Duration::from_secs(30));
+            .with_request_timeout(Duration::from_secs(60));
         let protocols = [(MYCELIUM_STORAGE_PROTOCOL, ProtocolSupport::Full)];
-        let request_response = CborReqResp::new(protocols, req_resp_config);
+        let request_response = ReqRespBehaviour::with_codec(MyceliumStorageCodec, protocols, req_resp_config);
 
         // 4. Cấu hình Identify
         let identify_config = IdentifyConfig::new(

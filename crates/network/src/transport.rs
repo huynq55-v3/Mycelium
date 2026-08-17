@@ -25,7 +25,9 @@ pub fn build_transport(
     // 1. Cấu hình Noise & Yamux
     let noise_config = noise::Config::new(keypair)
         .map_err(|e| NetworkError::TransportError(format!("Lỗi cấu hình Noise: {e}")))?;
-    let yamux_config = yamux::Config::default();
+    let mut yamux_config = yamux::Config::default();
+    yamux_config.set_max_buffer_size(64 * 1024 * 1024);
+    yamux_config.set_receive_window_size(16 * 1024 * 1024);
 
     // 2. Nâng cấp Relay Circuit Transport độc lập
     let upgraded_relay = relay_transport

@@ -1,6 +1,7 @@
 pub mod commit;
 pub mod daemon;
 pub mod download;
+pub mod dump;
 pub mod init;
 pub mod relay;
 pub mod status;

@@ -296,6 +296,9 @@ struct P2PEventLoop {
     known_relays: HashSet<Multiaddr>,
     known_peer_addrs: HashMap<PeerId, HashSet<Multiaddr>>,
     pending_fetches: HashMap<request_response::OutboundRequestId, usize>,
+    pending_pushes: HashMap<request_response::OutboundRequestId, (PeerId, String)>,
+    peer_shards: HashMap<PeerId, HashSet<String>>,
+    peer_r_ratios: HashMap<PeerId, f64>,
     fetch_sessions: HashMap<usize, PendingFetchRequest>,
     next_fetch_session_id: usize,
     rendezvous_info: Option<(RendezvousClient, Multiaddr, Option<String>)>,
@@ -321,6 +324,9 @@ impl P2PEventLoop {
             known_relays: HashSet::new(),
             known_peer_addrs: HashMap::new(),
             pending_fetches: HashMap::new(),
+            pending_pushes: HashMap::new(),
+            peer_shards: HashMap::new(),
+            peer_r_ratios: HashMap::new(),
             fetch_sessions: HashMap::new(),
             next_fetch_session_id: 1,
             rendezvous_info: None,
@@ -332,10 +338,16 @@ impl P2PEventLoop {
         let mut rebalance_interval = tokio::time::interval(Duration::from_secs(15));
         rebalance_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+        let mut prune_interval = tokio::time::interval(Duration::from_secs(60));
+        prune_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         loop {
             tokio::select! {
                 _ = rebalance_interval.tick() => {
                     self.perform_mesh_rebalance().await;
+                }
+                _ = prune_interval.tick() => {
+                    self.perform_mesh_prune_redundancy().await;
                 }
                 Some(cmd) = self.command_rx.recv() => {
                     self.handle_command(cmd).await;
@@ -348,14 +360,120 @@ impl P2PEventLoop {
     }
 
     async fn perform_mesh_rebalance(&mut self) {
-        let storage_peers: Vec<PeerId> = self
+        // 1. Gửi báo cáo trạng thái định kỳ lên các Relay Servers
+        let qm_guard = self.quota_manager.read().await;
+        let my_hashes = self.blockstore.list_shard_hashes().unwrap_or_default();
+        let held_shards: Vec<crate::protocol::ShardItem> = my_hashes
+            .iter()
+            .map(|h| {
+                let file_cid = self.blockstore.get_file_cid_for_shard(h).unwrap_or(None).unwrap_or_else(|| "default_file".to_string());
+                crate::protocol::ShardItem {
+                    file_cid,
+                    shard_hash: h.clone(),
+                }
+            })
+            .collect();
+
+        let report = crate::protocol::NodeStateReport {
+            peer_id: self.local_peer_id.to_string(),
+            uploaded_bytes: qm_guard.my_uploaded_bytes,
+            stored_bytes: qm_guard.stored_shard_bytes,
+            r_ratio: qm_guard.current_r_ratio(),
+            held_shards,
+        };
+        drop(qm_guard);
+
+        for &relay in &self.reserved_relays {
+            let req = ShardRequest::ReportState(report.clone());
+            let _ = self.swarm.behaviour_mut().request_response.send_request(&relay, req);
+        }
+
+        let mut storage_peers: Vec<PeerId> = self
             .connected_peers
             .iter()
-            .cloned()
+            .copied()
             .filter(|p| !self.reserved_relays.contains(p) && !self.discovered_relays.contains(p))
             .collect();
 
         if storage_peers.is_empty() {
+            return;
+        }
+
+        // 2. Sắp xếp danh sách Peers theo thứ tự R tăng dần (Ưu tiên bơm Shard cho Node đói R < 4.0 trước)
+        storage_peers.sort_by(|a, b| {
+            let r_a = self.peer_r_ratios.get(a).copied().unwrap_or(0.0);
+            let r_b = self.peer_r_ratios.get(b).copied().unwrap_or(0.0);
+            r_a.partial_cmp(&r_b).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        if my_hashes.is_empty() {
+            return;
+        }
+
+        // 3. Cơ chế Round-Robin Chuẩn mực: Mỗi chu kỳ chỉ gửi ĐÚNG 1 SHARD cho mỗi Peer đang đói (R < 4.5)
+        for &peer in &storage_peers {
+            let peer_r = self.peer_r_ratios.get(&peer).copied().unwrap_or(0.0);
+            if peer_r >= 4.5 {
+                // Peer này đã no nê đạt trần cân bằng (R >= 4.5), không cần bơm thêm
+                continue;
+            }
+
+            let in_flight = self.pending_pushes.values().filter(|(p, _)| p == &peer).count();
+            if in_flight >= 1 {
+                // Đang có 1 shard in-flight đang truyền, đợi truyền xong mới gửi shard tiếp theo
+                continue;
+            }
+
+            // Tìm đúng 1 Shard tiếp theo mà peer này chưa lưu trữ
+            for hash in &my_hashes {
+                let already_has = self.peer_shards.get(&peer).map(|s| s.contains(hash)).unwrap_or(false);
+                let already_in_flight = self.pending_pushes.values().any(|(p, h)| p == &peer && h == hash);
+                if !already_has && !already_in_flight {
+                    if let Ok(Some(data)) = self.blockstore.get_shard(hash) {
+                        let shard_kb = data.len() as f64 / 1024.0;
+                        let file_cid = self.blockstore.get_file_cid_for_shard(hash).unwrap_or(None);
+                        let req = ShardRequest::Push(crate::protocol::PushShard {
+                            hash: hash.clone(),
+                            file_cid,
+                            data,
+                        });
+                        let held_count = self.peer_shards.get(&peer).map(|s| s.len()).unwrap_or(0);
+                        info!("📤 [Mesh Diffusion] Đang gửi 1 shard {}... ({:.2} KB) sang peer {} (R={:.2}, hiện giữ {} shards)", &hash[..12], shard_kb, peer, peer_r, held_count);
+                        let req_id = self.swarm.behaviour_mut().request_response.send_request(&peer, req);
+                        self.pending_pushes.insert(req_id, (peer, hash.clone()));
+                        break; // Mỗi chu kỳ chỉ gửi đúng 1 shard cho peer này
+                    }
+                }
+            }
+        }
+    }
+
+    /// Kiểm tra độ dôi dư Shard trên toàn mạng qua DHT. Nếu > 50 shards online, thu hồi định lượng T = Count - 50 từ các node no nê.
+    async fn perform_mesh_prune_redundancy(&mut self) {
+        let storage_peers: Vec<PeerId> = self
+            .connected_peers
+            .iter()
+            .copied()
+            .filter(|p| !self.reserved_relays.contains(p) && !self.discovered_relays.contains(p))
+            .collect();
+
+        if storage_peers.is_empty() {
+            return;
+        }
+
+        // Lọc các peers có R cao (no nê: R > 4.5), sắp xếp theo R giảm dần (node no nhất xếp đầu)
+        let mut full_peers: Vec<PeerId> = storage_peers
+            .into_iter()
+            .filter(|p| self.peer_r_ratios.get(p).copied().unwrap_or(0.0) > 4.5)
+            .collect();
+
+        full_peers.sort_by(|a, b| {
+            let r_a = self.peer_r_ratios.get(a).copied().unwrap_or(0.0);
+            let r_b = self.peer_r_ratios.get(b).copied().unwrap_or(0.0);
+            r_b.partial_cmp(&r_a).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        if full_peers.is_empty() {
             return;
         }
 
@@ -364,20 +482,9 @@ impl P2PEventLoop {
             _ => return,
         };
 
-        // Phân tán các shards hiện có sang các storage peers làm Cache (tối đa 20 shards/peer)
-        let shards_per_peer = (shard_hashes.len() / storage_peers.len().max(1)).clamp(1, 20);
-        let sample_count = (storage_peers.len() * shards_per_peer).min(shard_hashes.len());
-        info!("🔄 [Mesh Diffusion] Đang tự động chia sẻ {} shard cache (tối đa {}/peer) sang {} storage peer(s)...", sample_count, shards_per_peer, storage_peers.len());
-        for i in 0..sample_count {
-            let hash = &shard_hashes[i % shard_hashes.len()];
-            if let Ok(Some(data)) = self.blockstore.get_shard(hash) {
-                let target_peer = storage_peers[i % storage_peers.len()];
-                let req = ShardRequest::Push(crate::protocol::PushShard {
-                    hash: hash.clone(),
-                    data,
-                });
-                let _ = self.swarm.behaviour_mut().request_response.send_request(&target_peer, req);
-            }
+        for hash in shard_hashes {
+            let key = RecordKey::new(&hash.as_bytes());
+            let _ = self.swarm.behaviour_mut().kademlia.get_providers(key);
         }
     }
 
@@ -483,9 +590,13 @@ impl P2PEventLoop {
                                     let _ = self.swarm.dial(addr.clone());
                                 }
                             } else {
-                                // Ghép với Relay hiện có (nếu có) để tạo Circuit Address
+                                // Ghép với Relay đang có Reservation (đã kết nối thành công) để tạo Circuit Address
+                                let mut dialed = false;
                                 for relay_addr in &self.known_relays {
                                     if let Some(relay_id) = extract_peer_id(relay_addr) {
+                                        if !self.reserved_relays.contains(&relay_id) {
+                                            continue; // Chỉ dùng Relay mà máy này đã đăng ký Reservation thành công
+                                        }
                                         let relay_with_id = ensure_relay_peer_id(relay_addr.clone(), &relay_id);
                                         let circuit_addr = relay_with_id
                                             .with(libp2p::multiaddr::Protocol::P2pCircuit)
@@ -501,9 +612,10 @@ impl P2PEventLoop {
                                             .kademlia
                                             .add_address(&peer_id, circuit_addr.clone());
 
-                                        if !self.connected_peers.contains(&peer_id) {
+                                        if !self.connected_peers.contains(&peer_id) && !dialed {
                                             info!("⚡ Nối cầu Circuit tới Storage Peer: {} ({})", peer_id, circuit_addr);
                                             let _ = self.swarm.dial(circuit_addr);
+                                            dialed = true; // Chỉ dial 1 đường hầm ưu tiên, tránh dồn nhiều kết nối đồng thời gây tràn tài nguyên
                                         }
                                     }
                                 }
@@ -546,6 +658,7 @@ impl P2PEventLoop {
                         let target_peer = target_peers[i % total_peers];
                         let req = ShardRequest::Push(PushShard {
                             hash: shard.hash.clone(),
+                            file_cid: None,
                             data: shard.data,
                         });
                         self.swarm
@@ -900,12 +1013,27 @@ impl P2PEventLoop {
             } => match request {
                 ShardRequest::Push(push) => {
                     let shard_len = push.data.len() as u64;
+                    let already_has = self.blockstore.has_shard(&push.hash).unwrap_or(false);
+                    if already_has {
+                        let resp = ShardResponse::Push(PushResponse {
+                            accepted: true,
+                            reason: None,
+                        });
+                        let _ = self
+                            .swarm
+                            .behaviour_mut()
+                            .request_response
+                            .send_response(channel, resp);
+                        return;
+                    }
+
                     let quota_guard = self.quota_manager.read().await;
 
-                    if quota_guard.can_accept_shard(&self.blockstore, shard_len, false) {
+                    if quota_guard.can_accept_shard(&self.blockstore, shard_len, true) {
                         drop(quota_guard);
 
-                        if let Err(e) = self.blockstore.put_shard(&push.hash, &push.data) {
+                        let file_cid = push.file_cid.as_deref().unwrap_or("default_file");
+                        if let Err(e) = self.blockstore.put_shard_with_file(&push.hash, file_cid, &push.data) {
                             error!("Lỗi khi ghi shard vào blockstore: {}", e);
                             let resp = ShardResponse::Push(PushResponse {
                                 accepted: false,
@@ -920,7 +1048,14 @@ impl P2PEventLoop {
                         }
 
                         // Ghi nhận tăng stored_shard_bytes trong QuotaManager
-                        self.quota_manager.write().await.record_stored_shard(shard_len);
+                        {
+                            let mut qm = self.quota_manager.write().await;
+                            qm.record_stored_shard(shard_len);
+                            if let Some(home) = dirs::home_dir() {
+                                let quota_file = home.join(".p2pdrive").join("quota.json");
+                                let _ = qm.save_to_file(&quota_file);
+                            }
+                        }
 
                         let key = RecordKey::new(&push.hash.as_bytes());
                         let _ = self.swarm.behaviour_mut().kademlia.start_providing(key);
@@ -936,7 +1071,7 @@ impl P2PEventLoop {
                             .request_response
                             .send_response(channel, resp);
                     } else {
-                        warn!("Từ chối lưu shard {} vì vượt quá hạn mức ổ cứng hoặc trần cache (R > 5.0)", push.hash);
+                        warn!("⚠️ Từ chối lưu shard {} ({:.2} KB) từ peer {} vì vượt quá hạn mức ổ cứng hoặc trần cache (R > 5.0)", push.hash, shard_len as f64 / 1024.0, peer);
                         let resp = ShardResponse::Push(PushResponse {
                             accepted: false,
                             reason: Some("Vượt quá hạn mức ổ cứng phân bổ hoặc trần cache".to_string()),
@@ -964,16 +1099,12 @@ impl P2PEventLoop {
                         .send_response(channel, resp);
                 }
                 ShardRequest::Prune(prune) => {
-                    let mut quota_guard = self.quota_manager.write().await;
-                    let has_shard = self.blockstore.has_shard(&prune.hash).unwrap_or(false);
+                    if let Ok(Some(data)) = self.blockstore.get_shard(&prune.hash) {
+                        let shard_len = data.len() as u64;
+                        let mut quota_guard = self.quota_manager.write().await;
 
-                    if has_shard {
-                        if let Ok(Some(data)) = self.blockstore.get_shard(&prune.hash) {
-                            let shard_len = data.len() as u64;
-                            let current_stored = quota_guard.stored_shard_bytes;
-                            let next_stored = current_stored.saturating_sub(shard_len);
-
-                            // Kiểm tra xem xóa shard có làm R < 4.0 hay không
+                        if quota_guard.my_uploaded_bytes > 0 {
+                            let next_stored = quota_guard.stored_shard_bytes.saturating_sub(shard_len);
                             let can_prune = if quota_guard.my_uploaded_bytes == 0 {
                                 true
                             } else {
@@ -1020,15 +1151,130 @@ impl P2PEventLoop {
                         .request_response
                         .send_response(channel, resp);
                 }
+                ShardRequest::ReportState(_) => {
+                    let _ = self
+                        .swarm
+                        .behaviour_mut()
+                        .request_response
+                        .send_response(channel, ShardResponse::Ack);
+                }
+                ShardRequest::SyncSwarmState(broadcast) => {
+                    // Cập nhật trạng thái toàn mạng từ Relay
+                    for node in &broadcast.nodes {
+                        if let Ok(pid) = node.peer_id.parse::<PeerId>() {
+                            if pid != self.local_peer_id {
+                                if let Some(r) = node.r_ratio {
+                                    self.peer_r_ratios.insert(pid, r);
+                                }
+                                let shard_set: HashSet<String> = node.held_shards.iter().map(|s| s.shard_hash.clone()).collect();
+                                self.peer_shards.insert(pid, shard_set);
+                            }
+                        }
+                    }
+                    let _ = self
+                        .swarm
+                        .behaviour_mut()
+                        .request_response
+                        .send_response(channel, ShardResponse::Ack);
+
+                    // Kiểm tra và thu hồi Shard thừa định lượng theo File (> 50 shards của file trên toàn mạng)
+                    if let Ok(my_hashes) = self.blockstore.list_shard_hashes() {
+                        let mut quota_guard = self.quota_manager.write().await;
+                        for hash in my_hashes {
+                            let file_cid = self.blockstore.get_file_cid_for_shard(&hash).unwrap_or(None).unwrap_or_else(|| "default_file".to_string());
+                            let total_file_shards: usize = broadcast
+                                .nodes
+                                .iter()
+                                .map(|n| n.held_shards.iter().filter(|s| s.file_cid == file_cid).count())
+                                .sum();
+
+                            if total_file_shards > 50 {
+                                let redundant_count = total_file_shards - 50;
+                                let mut nodes_with_file: Vec<&crate::protocol::NodeStateReport> = broadcast
+                                    .nodes
+                                    .iter()
+                                    .filter(|n| n.held_shards.iter().any(|s| s.file_cid == file_cid))
+                                    .collect();
+
+                                nodes_with_file.sort_by(|a, b| {
+                                    let r_a = a.r_ratio.unwrap_or(0.0);
+                                    let r_b = b.r_ratio.unwrap_or(0.0);
+                                    r_b.partial_cmp(&r_a).unwrap_or(std::cmp::Ordering::Equal)
+                                });
+
+                                let top_full_nodes: Vec<&crate::protocol::NodeStateReport> = nodes_with_file
+                                    .into_iter()
+                                    .take(redundant_count)
+                                    .filter(|n| n.r_ratio.unwrap_or(0.0) > 4.5)
+                                    .collect();
+
+                                let am_in_top = top_full_nodes.iter().any(|n| n.peer_id == self.local_peer_id.to_string());
+                                if am_in_top {
+                                    if let Ok(Some(data)) = self.blockstore.get_shard(&hash) {
+                                        let shard_len = data.len() as u64;
+                                        if quota_guard.my_uploaded_bytes > 0 {
+                                            let next_stored = quota_guard.stored_shard_bytes.saturating_sub(shard_len);
+                                            let next_r = next_stored as f64 / quota_guard.my_uploaded_bytes as f64;
+                                            if next_r >= 4.0 {
+                                                let _ = self.blockstore.delete_shard(&hash);
+                                                quota_guard.record_pruned_shard(shard_len);
+                                                info!("🗑️ [File Prune] Đã tự động thu hồi shard thừa {} của file {} (toàn mạng có {} shards của file này, R_mới={:.3})", &hash[..12], &file_cid[..file_cid.len().min(12)], total_file_shards, next_r);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                ShardRequest::QueryStats(_) => {
+                    let qm = self.quota_manager.read().await;
+                    let resp = ShardResponse::Stats(crate::protocol::PeerStatsResponse {
+                        peer_id: self.local_peer_id.to_string(),
+                        my_uploaded_bytes: qm.my_uploaded_bytes,
+                        stored_shard_bytes: qm.stored_shard_bytes,
+                        r_ratio: qm.current_r_ratio(),
+                    });
+                    let _ = self
+                        .swarm
+                        .behaviour_mut()
+                        .request_response
+                        .send_response(channel, resp);
+                }
             },
             request_response::Event::Message {
-                peer: _,
+                peer,
                 message:
                     Message::Response {
                         request_id,
                         response,
                     },
             } => {
+                if let ShardResponse::Stats(ref stats) = response {
+                    let r = stats.r_ratio.unwrap_or(0.0);
+                    self.peer_r_ratios.insert(peer, r);
+                    info!("📊 [Peer Stats] Peer {} công bố R = {:.3} (Upload: {:.2} MB, Stored: {:.2} MB)", peer, r, stats.my_uploaded_bytes as f64 / 1048576.0, stats.stored_shard_bytes as f64 / 1048576.0);
+                }
+
+                if let ShardResponse::Push(PushResponse { accepted, reason }) = &response {
+                    if let Some((target_peer, hash)) = self.pending_pushes.remove(&request_id) {
+                        if *accepted {
+                            self.peer_shards.entry(target_peer).or_default().insert(hash);
+                            let count = self.peer_shards.get(&target_peer).map(|s| s.len()).unwrap_or(0);
+                            info!("✅ [Mesh Diffusion] Peer {} đã chấp nhận và lưu trữ shard cache! (Hiện giữ: {}/20 shards)", target_peer, count);
+                        } else {
+                            // Ghi nhận shard này đã xử lý với peer để không gửi lặp lại
+                            self.peer_shards.entry(target_peer).or_default().insert(hash);
+                            if let Some(r_str) = reason {
+                                if r_str.contains("trần cache") || r_str.contains("R > 5.0") || r_str.contains("hạn mức") {
+                                    self.peer_r_ratios.insert(target_peer, 5.0);
+                                }
+                                warn!("⚠️ [Mesh Diffusion] Peer {} từ chối nhận shard cache: {}", target_peer, r_str);
+                            }
+                        }
+                    }
+                }
+
                 if let Some(session_id) = self.pending_fetches.remove(&request_id) {
                     if let ShardResponse::Pull(PullResponse { data: Some(data) }) = response {
                         if let Some(session) = self.fetch_sessions.get_mut(&session_id) {
@@ -1072,8 +1318,8 @@ impl P2PEventLoop {
                     }
                 }
             }
-            request_response::Event::OutboundFailure { request_id, error, .. } => {
-                debug!("Lỗi gửi yêu cầu Shard (request_id={}): {}", request_id, error);
+            request_response::Event::OutboundFailure { peer, request_id, error, .. } => {
+                warn!("⚠️ [Mesh Diffusion] Lỗi gửi yêu cầu Shard sang peer {} (request_id={}): {:?}", peer, request_id, error);
                 if let Some(session_id) = self.pending_fetches.remove(&request_id) {
                     let has_remaining = self.pending_fetches.values().any(|&sid| sid == session_id);
                     if !has_remaining {
@@ -1089,6 +1335,9 @@ impl P2PEventLoop {
                         }
                     }
                 }
+            }
+            request_response::Event::InboundFailure { peer, error, .. } => {
+                warn!("⚠️ [Mesh Cache] Lỗi nhận luồng Shard từ peer {}: {:?}", peer, error);
             }
             _ => {}
         }

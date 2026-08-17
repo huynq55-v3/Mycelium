@@ -137,6 +137,21 @@ enum Commands {
         #[arg(value_name = "PATH")]
         path: String,
     },
+
+    /// [CLIENT MODE] Khôi phục / Dump toàn bộ dữ liệu người dùng từ Private Key vào thư mục đầu ra
+    Dump {
+        /// Khóa bí mật của người dùng (mã Hex 64 ký tự) hoặc đường dẫn file identity.json
+        #[arg(short = 'k', long = "private-key", value_name = "PRIVATE_KEY")]
+        private_key: String,
+
+        /// Thư mục đích để lưu toàn bộ dữ liệu khôi phục (mặc định ./dump_output)
+        #[arg(short = 'o', long = "output-dir", value_name = "OUTPUT_DIR", default_value = "./dump_output")]
+        output: PathBuf,
+
+        /// Đường dẫn tới file vfs_tree.enc (tùy chọn, mặc định lấy ~/.p2pdrive/vfs_tree.enc)
+        #[arg(long = "vfs-path", value_name = "VFS_PATH")]
+        vfs_path: Option<PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -207,6 +222,13 @@ async fn main() -> Result<()> {
         }
         Commands::Rm { path } => {
             commands::vfs_cmds::handle_rm(path).await?;
+        }
+        Commands::Dump {
+            private_key,
+            output,
+            vfs_path,
+        } => {
+            commands::dump::handle_dump(private_key, output, vfs_path).await?;
         }
     }
 

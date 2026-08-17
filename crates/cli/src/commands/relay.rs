@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -9,13 +10,13 @@ use libp2p::autonat::{self, Config as AutoNatConfig};
 use libp2p::identify::{self, Config as IdentifyConfig};
 use libp2p::identity::Keypair;
 use libp2p::relay;
+use libp2p::request_response::{self, Behaviour as ReqRespBehaviour, Config as ReqRespConfig, Message, ProtocolSupport};
 use libp2p::swarm::{NetworkBehaviour, Swarm, SwarmEvent};
 use libp2p::Multiaddr;
+use network::behaviour::{MYCELIUM_RELAY_AGENT_VERSION, MYCELIUM_RELAY_PROTOCOL, MYCELIUM_STORAGE_PROTOCOL};
+use network::protocol::{MyceliumStorageCodec, NodeStateReport, ShardRequest, ShardResponse, SwarmStateBroadcast};
 use network::transport::build_transport;
-use network::{
-    behaviour::{MYCELIUM_RELAY_AGENT_VERSION, MYCELIUM_RELAY_PROTOCOL},
-    RendezvousClient,
-};
+use network::RendezvousClient;
 use tokio::signal;
 use tracing::{debug, info, warn};
 
@@ -25,13 +26,14 @@ pub const DEFAULT_RELAY_PORT: u16 = 4002;
 
 use libp2p::ping;
 
-/// Hành vi mạng chuyên dụng cho Dedicated Relay Server (Không Storage, Không Quota, Không DHT Pollution).
+/// Hành vi mạng chuyên dụng cho Dedicated Relay Server kiêm Swarm State Coordinator.
 #[derive(NetworkBehaviour)]
 pub struct PureRelayBehaviour {
     pub identify: identify::Behaviour,
     pub relay_server: relay::Behaviour,
     pub autonat: autonat::Behaviour,
     pub ping: ping::Behaviour,
+    pub request_response: ReqRespBehaviour<MyceliumStorageCodec>,
 }
 
 async fn detect_public_or_lan_ip() -> String {
@@ -86,16 +88,9 @@ pub async fn handle_relay(
     println!("  (Trạm trung chuyển dữ liệu vượt NAT - Zero Storage Database) ");
     println!("============================================================");
 
-    // 1. Quản lý Relay Identity độc lập
-    let relay_identity_path = config_dir.join("relay_identity.json");
-    let identity = if relay_identity_path.exists() {
-        Identity::load_from_file(&relay_identity_path)?
-    } else {
-        let id = Identity::generate();
-        let _ = id.save_to_file(&relay_identity_path);
-        id
-    };
-    println!("🆔 Relay DID: \x1b[1;32m{}\x1b[0m", identity.to_did());
+    // 1. Khởi tạo Relay Identity tạm thời (Ephemeral in-memory, không cần lưu đĩa)
+    let identity = Identity::generate();
+    println!("🆔 Relay DID: \x1b[1;32m{}\x1b[0m (Ephemeral)", identity.to_did());
 
     // 2. Nạp SwarmKey (Hỗ trợ từ ENV SWARM_KEY hoặc file swarm.key)
     let swarm_key = if let Ok(key_hex) = std::env::var("SWARM_KEY") {
@@ -136,10 +131,12 @@ pub async fn handle_relay(
     let identify = identify::Behaviour::new(identify_config);
 
     let relay_config = relay::Config {
-        max_reservations: 256,
-        max_circuits: 512,
-        max_circuit_duration: Duration::from_secs(300),
-        max_circuit_bytes: 1024 * 1024 * 500, // 500 MB per circuit
+        max_reservations: 1024,
+        max_reservations_per_peer: 64,
+        max_circuits: 2048,
+        max_circuits_per_peer: 128,
+        max_circuit_duration: Duration::from_secs(3600),
+        max_circuit_bytes: 1024 * 1024 * 1024, // 1 GB per circuit
         reservation_rate_limiters: vec![],
         circuit_src_rate_limiters: vec![],
         ..Default::default()
@@ -147,12 +144,17 @@ pub async fn handle_relay(
     let relay_server = relay::Behaviour::new(local_peer_id, relay_config);
     let autonat = autonat::Behaviour::new(local_peer_id, AutoNatConfig::default());
     let ping = ping::Behaviour::new(ping::Config::new().with_interval(Duration::from_secs(15)));
+    let req_resp_config = ReqRespConfig::default()
+        .with_request_timeout(Duration::from_secs(60));
+    let protocols = [(MYCELIUM_STORAGE_PROTOCOL, ProtocolSupport::Full)];
+    let request_response = ReqRespBehaviour::with_codec(MyceliumStorageCodec, protocols, req_resp_config);
 
     let behaviour = PureRelayBehaviour {
         identify,
         relay_server,
         autonat,
         ping,
+        request_response,
     };
 
     let mut swarm = Swarm::new(
@@ -211,9 +213,44 @@ pub async fn handle_relay(
     println!("✨ Relay Node đang hoạt động 24/7. Nhấn \x1b[1;31mCtrl+C\x1b[0m để dừng.");
     println!("============================================================");
 
-    // 7. Event loop chạy nền cho Relay Server
+fn duration_until_next_minute_slot(interval_secs: u64) -> Duration {
+    let now = std::time::SystemTime::now();
+    let since_epoch = now.duration_since(std::time::UNIX_EPOCH).unwrap();
+    let seconds = since_epoch.as_secs();
+    let nanos = since_epoch.subsec_nanos();
+    let next_slot_secs = (seconds / interval_secs + 1) * interval_secs;
+    let diff_secs = next_slot_secs - seconds;
+    Duration::from_secs(diff_secs).saturating_sub(Duration::from_nanos(nanos as u64))
+}
+
+    let mut node_reports: HashMap<libp2p::PeerId, NodeStateReport> = HashMap::new();
+    let mut connected_node_peers: HashSet<libp2p::PeerId> = HashSet::new();
+
+    // Đồng bộ tuyệt đối theo mốc giây đầu tiên của mỗi phút (Wall-clock minute alignment)
+    let initial_delay = duration_until_next_minute_slot(60);
+    info!("⏰ [RELAY SWARM] Đang chờ {}s để đồng bộ chu kỳ Heartbeat bắt đầu từ đúng giây đầu tiên của phút...", initial_delay.as_secs());
+    tokio::time::sleep(initial_delay).await;
+
+    let mut relay_heartbeat_interval = tokio::time::interval(Duration::from_secs(60));
+    relay_heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    // 7. Event loop chạy nền cho Relay Server kiêm Swarm Coordinator
     loop {
         tokio::select! {
+            _ = relay_heartbeat_interval.tick() => {
+                let nodes: Vec<NodeStateReport> = node_reports.values().cloned().collect();
+                if !nodes.is_empty() && !connected_node_peers.is_empty() {
+                    let broadcast = SwarmStateBroadcast {
+                        nodes,
+                        timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+                    };
+                    info!("📡 [RELAY SWARM] Phát sóng SwarmStateBroadcast ({} nodes) tới {} peers", broadcast.nodes.len(), connected_node_peers.len());
+                    for peer in &connected_node_peers {
+                        let req = ShardRequest::SyncSwarmState(broadcast.clone());
+                        swarm.behaviour_mut().request_response.send_request(peer, req);
+                    }
+                }
+            }
             event = swarm.select_next_some() => {
                 match event {
                     SwarmEvent::NewListenAddr { address, .. } => {
@@ -221,9 +258,22 @@ pub async fn handle_relay(
                     }
                     SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                         info!("🤝 [RELAY] Peer đã kết nối thành công: {} ({:?})", peer_id, endpoint.get_remote_address());
+                        connected_node_peers.insert(peer_id);
+                        // Gửi ngay snapshot hiện có cho peer mới cắm vào
+                        let nodes: Vec<NodeStateReport> = node_reports.values().cloned().collect();
+                        if !nodes.is_empty() {
+                            let broadcast = SwarmStateBroadcast {
+                                nodes,
+                                timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+                            };
+                            let req = ShardRequest::SyncSwarmState(broadcast);
+                            swarm.behaviour_mut().request_response.send_request(&peer_id, req);
+                        }
                     }
                     SwarmEvent::ConnectionClosed { peer_id, .. } => {
                         info!("👋 [RELAY] Peer đã ngắt kết nối: {}", peer_id);
+                        connected_node_peers.remove(&peer_id);
+                        node_reports.remove(&peer_id);
                     }
                     SwarmEvent::Behaviour(PureRelayBehaviourEvent::RelayServer(relay_event)) => {
                         match relay_event {
@@ -246,6 +296,32 @@ pub async fn handle_relay(
                                 info!("🔌 [RELAY] Đã đóng cầu nối: {} <=====> {} (lý do: {:?})", src_peer_id, dst_peer_id, error);
                             }
                             _ => {}
+                        }
+                    }
+                    SwarmEvent::Behaviour(PureRelayBehaviourEvent::RequestResponse(req_event)) => {
+                        if let request_response::Event::Message { peer, message } = req_event {
+                            match message {
+                                Message::Request { request, channel, .. } => {
+                                    match request {
+                                        ShardRequest::ReportState(report) => {
+                                            info!("📊 [RELAY SWARM] Nhận báo cáo trạng thái từ Node {}: R={:?} ({} shards)", peer, report.r_ratio, report.held_shards.len());
+                                            node_reports.insert(peer, report.clone());
+                                            // Forward / Gossip sang các Relay hoặc Peer khác
+                                            for other_peer in &connected_node_peers {
+                                                if *other_peer != peer {
+                                                    let fwd_req = ShardRequest::ReportState(report.clone());
+                                                    swarm.behaviour_mut().request_response.send_request(other_peer, fwd_req);
+                                                }
+                                            }
+                                            let _ = swarm.behaviour_mut().request_response.send_response(channel, ShardResponse::Ack);
+                                        }
+                                        _ => {
+                                            let _ = swarm.behaviour_mut().request_response.send_response(channel, ShardResponse::Ack);
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
                         }
                     }
                     _ => {}

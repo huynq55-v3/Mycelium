@@ -88,11 +88,22 @@ pub async fn handle_daemon(
 
     // 4. Nạp QuotaManager
     let quota_path = config_dir.join("quota.json");
-    let quota = if quota_path.exists() {
+    let mut quota = if quota_path.exists() {
         QuotaManager::load_from_file(&quota_path)?
     } else {
         QuotaManager::default_60gb()
     };
+
+    let total_blockstore_bytes = blockstore.total_payload_bytes().unwrap_or(0);
+    if total_blockstore_bytes == 0 {
+        if quota.stored_shard_bytes > 0 {
+            quota.stored_shard_bytes = 0;
+            let _ = quota.save_to_file(&quota_path);
+        }
+    } else if quota.stored_shard_bytes != total_blockstore_bytes {
+        quota.stored_shard_bytes = total_blockstore_bytes;
+        let _ = quota.save_to_file(&quota_path);
+    }
     let quota_manager = Arc::new(RwLock::new(quota));
 
     // 5. Khởi động P2PService (Storage Node Client với Relay Client & DCUtR)
