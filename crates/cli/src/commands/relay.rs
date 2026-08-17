@@ -63,8 +63,8 @@ async fn detect_public_or_lan_ip() -> String {
 pub async fn handle_relay(
     port_opt: Option<u16>,
     public_port_opt: Option<u16>,
+    public_host_opt: Option<String>,
     rendezvous_url_opt: Option<String>,
-    public_ip_opt: Option<String>,
     swarm_key_opt: Option<PathBuf>,
 ) -> Result<()> {
     let listen_port = port_opt.unwrap_or(DEFAULT_RELAY_PORT);
@@ -161,20 +161,28 @@ pub async fn handle_relay(
         println!("🌐 IPv6 Dual-Stack: Đang lắng nghe tại \x1b[1;36m{}\x1b[0m", ipv6_addr);
     }
 
-    // 6. Phát hiện IP và gửi Heartbeat lên Rendezvous Server (sử dụng public_port từ ngrok/router)
-    let resolved_ip = match public_ip_opt {
-        Some(ip) => ip,
+    // 6. Phát hiện IP/Host và gửi Heartbeat lên Rendezvous Server
+    let host_or_ip = match public_host_opt {
+        Some(host) => host,
         None => detect_public_or_lan_ip().await,
     };
-    let is_v6 = resolved_ip.contains(':');
-    let proto_prefix = if is_v6 { "ip6" } else { "ip4" };
-    println!("🌐 Địa chỉ công bố ra ngoài: \x1b[1;32m{}:{}\x1b[0m ({})", resolved_ip, public_port, proto_prefix.to_uppercase());
+
+    let public_multiaddr: Multiaddr = if host_or_ip.contains('.') && host_or_ip.chars().any(|c| c.is_alphabetic()) {
+        // Domain name (ngrok / custom domain) -> Dùng dns4
+        format!("/dns4/{}/tcp/{}/p2p/{}", host_or_ip, public_port, local_peer_id).parse()?
+    } else if host_or_ip.contains(':') {
+        // IPv6
+        format!("/ip6/{}/tcp/{}/p2p/{}", host_or_ip, public_port, local_peer_id).parse()?
+    } else {
+        // IPv4
+        format!("/ip4/{}/tcp/{}/p2p/{}", host_or_ip, public_port, local_peer_id).parse()?
+    };
+
+    println!("🌐 Địa chỉ công bố ra ngoài: \x1b[1;32m{}:{}\x1b[0m", host_or_ip, public_port);
 
     let rendezvous = RendezvousClient::new(&rendezvous_url);
     println!("📡 Rendezvous Server: \x1b[1;34m{}\x1b[0m", rendezvous_url);
 
-    let public_multiaddr: Multiaddr = format!("/{}/{}/tcp/{}/p2p/{}", proto_prefix, resolved_ip, public_port, local_peer_id).parse()?;
-    
     let _heartbeat_handle = rendezvous.start_heartbeat_loop(
         local_peer_id,
         public_multiaddr.clone(),

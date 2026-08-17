@@ -72,13 +72,13 @@ enum Commands {
         #[arg(long)]
         public_port: Option<u16>,
 
+        /// Địa chỉ Host/Domain công khai hoặc IP (ví dụ 0.tcp.ap.ngrok.io hoặc 13.228.x.x)
+        #[arg(long)]
+        public_host: Option<String>,
+
         /// URL của Rendezvous / Bootstrap Server
         #[arg(short, long)]
         rendezvous_url: Option<String>,
-
-        /// Địa chỉ IP công cộng tĩnh (nếu cấu hình Port-Forwarding/VPS/ngrok)
-        #[arg(long)]
-        public_ip: Option<String>,
 
         /// Đường dẫn tới file Swarm Key riêng
         #[arg(short, long)]
@@ -141,11 +141,11 @@ async fn main() -> Result<()> {
         Commands::Relay {
             port,
             public_port,
+            public_host,
             rendezvous_url,
-            public_ip,
             swarm_key,
         } => {
-            commands::relay::handle_relay(port, public_port, rendezvous_url, public_ip, swarm_key).await?;
+            commands::relay::handle_relay(port, public_port, public_host, rendezvous_url, swarm_key).await?;
         }
         Commands::Upload { file_path } => {
             commands::upload::handle_upload(file_path).await?;

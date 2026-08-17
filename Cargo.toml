@@ -53,10 +53,11 @@ sled = "0.34"
 # HTTP Client
 reqwest = { version = "0.12", features = ["json"] }
 
-# Libp2p Networking với Relay v2, DCUtR và AutoNAT
+# Libp2p Networking với Relay v2, DCUtR, AutoNAT và DNS
 libp2p = { version = "0.54", features = [
     "tokio",
     "tcp",
+    "dns",
     "noise",
     "yamux",
     "mdns",
