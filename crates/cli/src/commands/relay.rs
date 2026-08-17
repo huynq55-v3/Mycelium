@@ -107,7 +107,7 @@ pub async fn handle_relay(
     let keypair = Keypair::from(libp2p::identity::ed25519::Keypair::from(libp2p_secret));
     let local_peer_id = keypair.public().to_peer_id();
 
-    let transport = build_transport(&keypair, swarm_key.as_ref())
+    let (transport, _relay_client) = build_transport(&keypair, swarm_key.as_ref())
         .context("Lỗi khởi tạo Transport")?;
 
     // 4. Khởi tạo Behaviour

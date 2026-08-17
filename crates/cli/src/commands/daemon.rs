@@ -95,13 +95,12 @@ pub async fn handle_daemon(
     };
     let quota_manager = Arc::new(RwLock::new(quota));
 
-    // 5. Khởi động P2PService (Storage Node Client)
+    // 5. Khởi động P2PService (Storage Node Client với Relay Client & DCUtR)
     let (service, _service_handle) = P2PService::new(
         &identity,
         swarm_key.as_ref(),
         blockstore.clone(),
         quota_manager.clone(),
-        false, // Storage node không đóng vai trò relay server
     ).context("Khởi tạo P2PService thất bại")?;
 
     // Lắng nghe Dual-Stack: IPv4

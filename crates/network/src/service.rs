@@ -74,7 +74,6 @@ impl P2PService {
         swarm_key: Option<&SwarmKey>,
         blockstore: BlockStore,
         quota_manager: Arc<RwLock<QuotaManager>>,
-        is_relay: bool,
     ) -> Result<(Self, tokio::task::JoinHandle<()>), NetworkError> {
         let secret_bytes = identity.secret_key_bytes();
         let libp2p_secret = libp2p::identity::ed25519::SecretKey::try_from_bytes(secret_bytes)
@@ -82,8 +81,8 @@ impl P2PService {
         let keypair = Keypair::from(libp2p::identity::ed25519::Keypair::from(libp2p_secret));
         let local_peer_id = keypair.public().to_peer_id();
 
-        let transport = build_transport(&keypair, swarm_key)?;
-        let behaviour = MyceliumBehaviour::new(&keypair, is_relay)
+        let (transport, relay_client) = build_transport(&keypair, swarm_key)?;
+        let behaviour = MyceliumBehaviour::new(&keypair, relay_client)
             .map_err(|e| NetworkError::TransportError(format!("Lỗi khởi tạo Behaviour: {e}")))?;
 
         let swarm = Swarm::new(
@@ -339,8 +338,13 @@ impl P2PEventLoop {
                         // Chủ động dial outbound nếu chưa kết nối
                         if !self.connected_peers.contains(&peer_id) {
                             debug!("Chủ động kết nối (Outbound dial) tới peer: {} ({})", peer_id, addr);
-                            let _ = self.swarm.dial(addr);
+                            let _ = self.swarm.dial(addr.clone());
                         }
+
+                        // Tự động đăng ký Circuit Reservation nếu peer có thể là Relay
+                        let circuit_addr = addr.with(libp2p::multiaddr::Protocol::P2pCircuit);
+                        let _ = self.swarm.listen_on(circuit_addr);
+
                         added += 1;
                     }
                 }
