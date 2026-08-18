@@ -392,8 +392,10 @@ impl P2PEventLoop {
         drop(qm_guard);
 
         for &relay in &self.reserved_relays {
-            let req = ShardRequest::ReportState(report.clone());
-            let _ = self.swarm.behaviour_mut().request_response.send_request(&relay, req);
+            if relay != self.local_peer_id {
+                let req = ShardRequest::ReportState(report.clone());
+                let _ = self.swarm.behaviour_mut().request_response.send_request(&relay, req);
+            }
         }
 
         let mut storage_peers: Vec<PeerId> = self
@@ -887,7 +889,7 @@ impl P2PEventLoop {
                     println!("🎉 Đã đăng ký thành công Relay Circuit: \x1b[1;32m{}\x1b[0m", address);
                     info!("🎉 Đã đăng ký thành công Relay Circuit: {}", address);
 
-                    if let Some(relay_id) = extract_peer_id(&address) {
+                    if let Some(relay_id) = extract_relay_peer_id(&address) {
                         self.pending_reservations.remove(&relay_id);
                         self.reserved_relays.insert(relay_id);
                     }
@@ -1356,6 +1358,24 @@ pub fn is_dialable_multiaddr(addr: &Multiaddr) -> bool {
     }
 
     has_valid_public_transport
+}
+
+fn extract_relay_peer_id(addr: &Multiaddr) -> Option<PeerId> {
+    let mut before_circuit = None;
+    for protocol in addr.iter() {
+        match protocol {
+            libp2p::multiaddr::Protocol::P2p(peer_id) => {
+                if before_circuit.is_none() {
+                    before_circuit = Some(peer_id);
+                }
+            }
+            libp2p::multiaddr::Protocol::P2pCircuit => {
+                return before_circuit;
+            }
+            _ => {}
+        }
+    }
+    before_circuit
 }
 
 fn extract_peer_id(addr: &Multiaddr) -> Option<PeerId> {
