@@ -559,24 +559,10 @@ impl P2PEventLoop {
                                 .kademlia
                                 .add_address(&peer_id, addr.clone());
 
-                            // Chủ động dial trực tiếp tới Relay Server
+                            // Chủ động dial trực tiếp tới Relay Server nếu chưa kết nối
                             if !self.connected_peers.contains(&peer_id) {
                                 info!("🔄 Đang quay số kết nối tới Relay: {} ({})", peer_id, addr);
                                 let _ = self.swarm.dial(addr.clone());
-                            }
-
-                            // Đăng ký Relay Reservation
-                            if !self.reserved_relays.contains(&peer_id) {
-                                let circuit_addr = relay_with_id.with(libp2p::multiaddr::Protocol::P2pCircuit);
-                                info!("🔗 Đang gửi yêu cầu Relay Circuit Reservation tại: {}", circuit_addr);
-                                match self.swarm.listen_on(circuit_addr) {
-                                    Ok(_) => {
-                                        self.reserved_relays.insert(peer_id);
-                                    }
-                                    Err(e) => {
-                                        warn!("❌ Lỗi đăng ký circuit_addr trên {}: {}", peer_id, e);
-                                    }
-                                }
                             }
                         } else {
                             // Địa chỉ Circuit định tuyến qua Relay -> Đây là Storage Peer
@@ -788,13 +774,8 @@ impl P2PEventLoop {
                         if !self.reserved_relays.contains(&peer_id) {
                             let circuit_addr = relay_with_id.with(libp2p::multiaddr::Protocol::P2pCircuit);
                             info!("🔗 Đang đăng ký Relay Circuit Reservation tại: {}", circuit_addr);
-                            match self.swarm.listen_on(circuit_addr) {
-                                Ok(_) => {
-                                    self.reserved_relays.insert(peer_id);
-                                }
-                                Err(e) => {
-                                    warn!("❌ Lỗi đăng ký circuit_addr trên {}: {}", peer_id, e);
-                                }
+                            if let Err(e) = self.swarm.listen_on(circuit_addr) {
+                                warn!("❌ Lỗi đăng ký circuit_addr trên {}: {}", peer_id, e);
                             }
                         }
                     }
@@ -893,13 +874,8 @@ impl P2PEventLoop {
                             if !self.reserved_relays.contains(&peer_id) {
                                 let circuit_addr = relay_with_id.with(libp2p::multiaddr::Protocol::P2pCircuit);
                                 info!("🔗 [Identify] Đang đăng ký Relay Circuit Reservation tại: {}", circuit_addr);
-                                match self.swarm.listen_on(circuit_addr) {
-                                    Ok(_) => {
-                                        self.reserved_relays.insert(peer_id);
-                                    }
-                                    Err(e) => {
-                                        warn!("❌ [Identify] Lỗi đăng ký circuit_addr trên Relay {}: {}", peer_id, e);
-                                    }
+                                if let Err(e) = self.swarm.listen_on(circuit_addr) {
+                                    warn!("❌ [Identify] Lỗi đăng ký circuit_addr trên Relay {}: {}", peer_id, e);
                                 }
                             }
                         } else {
@@ -913,6 +889,10 @@ impl P2PEventLoop {
                 if addr_str.contains("/p2p-circuit/") || addr_str.contains("/p2p-circuit") {
                     println!("🎉 Đã đăng ký thành công Relay Circuit: \x1b[1;32m{}\x1b[0m", address);
                     info!("🎉 Đã đăng ký thành công Relay Circuit: {}", address);
+
+                    if let Some(relay_id) = extract_peer_id(&address) {
+                        self.reserved_relays.insert(relay_id);
+                    }
 
                     // KHI ĐÃ CÓ RESERVATION XÁC NHẬN: Nối cầu Circuit tới các Storage Peers!
                     for relay_addr in &self.known_relays {
