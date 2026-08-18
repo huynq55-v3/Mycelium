@@ -712,6 +712,22 @@ impl IpcServer {
 
             let meta = fs::metadata(&disk_path)?;
             let file_size = meta.len();
+            let mtime_secs = meta.modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+
+            // Kiểm tra xem file đã được commit và không có thay đổi nào không
+            if let Some(existing_file) = tree.find_file(&clean_p) {
+                if existing_file.size == file_size && (mtime_secs <= existing_file.updated_at || mtime_secs == 0) {
+                    // File không thay đổi -> Bỏ qua không commit lại
+                    continue;
+                }
+                // Nếu file bị sửa đổi nội dung -> ghi nhận giảm dung lượng cũ trước khi nạp bản mới
+                let mut qm = self.quota_manager.write().await;
+                qm.record_delete(existing_file.size);
+            }
 
             // 1. Kiểm tra Quota / Atomic Ingest (chỉ kiểm tra nếu không phải first atomic batch)
             if !is_first_atomic_commit {
@@ -817,6 +833,19 @@ impl IpcServer {
             if let Ok(p) = AppConfig::config_dir() {
                 let _ = qm.save_to_file(&p.join("quota.json"));
             }
+        }
+
+        if committed_files.is_empty() {
+            let r_ratio = self.quota_manager.read().await.current_r_ratio();
+            Self::send_response(
+                writer,
+                &IpcResponse::CommitSuccess {
+                    committed_files: vec!["Không có tệp tin nào thay đổi để commit (Cây thư mục ảo đã ở trạng thái mới nhất)".to_string()],
+                    total_bytes: 0,
+                    r_ratio,
+                },
+            ).await?;
+            return Ok(());
         }
 
         self.save_vfs_tree(&tree).await?;
