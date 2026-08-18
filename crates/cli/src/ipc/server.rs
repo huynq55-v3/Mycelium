@@ -57,6 +57,16 @@ impl IpcServer {
 
         info!("IPC Server đang lắng nghe các lệnh CLI tại {}", DEFAULT_IPC_ADDR);
 
+        // Đồng bộ sẵn VirtualTree vào BlockStore khi khởi động để sẵn sàng phục vụ các node khác khôi phục
+        let tree_path = self.vfs_tree_path();
+        if tree_path.exists() {
+            if let Ok(bytes) = fs::read(&tree_path) {
+                let vfs_root_hash = erasure_codec::sha256_hex(format!("vfs_root:{}", self.identity.to_did()).as_bytes());
+                let file_cid = format!("vfs_root_{}", self.identity.to_did());
+                let _ = self.blockstore.put_shard_with_file(&vfs_root_hash, &file_cid, &bytes);
+            }
+        }
+
         loop {
             match listener.accept().await {
                 Ok((stream, addr)) => {
