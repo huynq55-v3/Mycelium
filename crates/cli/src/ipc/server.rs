@@ -273,7 +273,7 @@ impl IpcServer {
         )
         .await?;
 
-        if let Err(e) = self.service.distribute_shards(shards).await {
+        if let Err(e) = self.service.distribute_shards_with_file(shards, Some(encrypted_cid.clone())).await {
             Self::send_response(
                 writer,
                 &IpcResponse::Error(format!("Lỗi phân tán shards: {e}")),
@@ -756,7 +756,7 @@ impl IpcServer {
                 },
             ).await?;
 
-            if let Err(e) = self.service.distribute_shards(shards).await {
+            if let Err(e) = self.service.distribute_shards_with_file(shards, Some(enc_cid.clone())).await {
                 Self::send_response(writer, &IpcResponse::Error(format!("Lỗi phân tán shards: {e}"))).await?;
                 return Ok(());
             }

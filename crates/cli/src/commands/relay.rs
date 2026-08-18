@@ -225,6 +225,7 @@ fn duration_until_next_minute_slot(interval_secs: u64) -> Duration {
 
     let mut node_reports: HashMap<libp2p::PeerId, NodeStateReport> = HashMap::new();
     let mut connected_node_peers: HashSet<libp2p::PeerId> = HashSet::new();
+    let mut active_reservations: HashSet<libp2p::PeerId> = HashSet::new();
 
     // Đồng bộ tuyệt đối theo mốc giây đầu tiên của mỗi phút (Wall-clock minute alignment)
     let initial_delay = duration_until_next_minute_slot(60);
@@ -250,6 +251,12 @@ fn duration_until_next_minute_slot(interval_secs: u64) -> Duration {
                         swarm.behaviour_mut().request_response.send_request(peer, req);
                     }
                 }
+
+                // Gia hạn Heartbeat cho các Client Node đang cắm qua Relay lên Rendezvous
+                for client_peer in &active_reservations {
+                    let client_circuit_addr = format!("{}/p2p-circuit/p2p/{}", public_multiaddr, client_peer);
+                    let _ = rendezvous.send_heartbeat(&client_peer.to_string(), &[client_circuit_addr], Some("VN".to_string())).await;
+                }
             }
             event = swarm.select_next_some() => {
                 match event {
@@ -273,18 +280,28 @@ fn duration_until_next_minute_slot(interval_secs: u64) -> Duration {
                     SwarmEvent::ConnectionClosed { peer_id, .. } => {
                         info!("👋 [RELAY] Peer đã ngắt kết nối: {}", peer_id);
                         connected_node_peers.remove(&peer_id);
+                        active_reservations.remove(&peer_id);
                         node_reports.remove(&peer_id);
                     }
                     SwarmEvent::Behaviour(PureRelayBehaviourEvent::RelayServer(relay_event)) => {
                         match relay_event {
                             relay::Event::ReservationReqAccepted { src_peer_id, renewed } => {
                                 info!("🎉 [RELAY] Đã cấp Reservation thành công cho peer: {} (renewed={})", src_peer_id, renewed);
+                                active_reservations.insert(src_peer_id);
+                                let client_circuit_addr = format!("{}/p2p-circuit/p2p/{}", public_multiaddr, src_peer_id);
+                                let rz = rendezvous.clone();
+                                let src_str = src_peer_id.to_string();
+                                tokio::spawn(async move {
+                                    info!("📡 [RELAY] Đăng ký địa chỉ Circuit lên Rendezvous cho client {}: {}", src_str, client_circuit_addr);
+                                    let _ = rz.send_heartbeat(&src_str, &[client_circuit_addr], Some("VN".to_string())).await;
+                                });
                             }
                             relay::Event::ReservationReqDenied { src_peer_id } => {
                                 warn!("❌ [RELAY] TỪ CHỐI cấp Reservation cho peer: {}", src_peer_id);
                             }
                             relay::Event::ReservationTimedOut { src_peer_id } => {
                                 debug!("⏳ [RELAY] Reservation của peer {} đã hết hạn (Timed Out)", src_peer_id);
+                                active_reservations.remove(&src_peer_id);
                             }
                             relay::Event::CircuitReqAccepted { src_peer_id, dst_peer_id } => {
                                 info!("⚡ [RELAY] ĐANG BẮC CẦU THÔNG SUỐT: {} <=====> {}", src_peer_id, dst_peer_id);

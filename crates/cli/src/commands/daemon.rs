@@ -15,34 +15,6 @@ use tracing::info;
 use crate::config::AppConfig;
 use crate::ipc::IpcServer;
 
-/// Tự động phát hiện IP Public thực của máy (ưu tiên IPv6, fallback IPv4).
-async fn detect_public_or_lan_ip() -> String {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
-
-    let ip_services = [
-        "https://api64.ipify.org",
-        "https://api.ipify.org",
-        "https://ifconfig.me/ip",
-        "https://icanhazip.com",
-    ];
-
-    for url in ip_services {
-        if let Ok(res) = client.get(url).send().await {
-            if let Ok(ip_text) = res.text().await {
-                let trimmed = ip_text.trim();
-                if trimmed.parse::<IpAddr>().is_ok() {
-                    return trimmed.to_string();
-                }
-            }
-        }
-    }
-
-    "127.0.0.1".to_string()
-}
-
 pub async fn handle_daemon(
     port_opt: Option<u16>,
     rendezvous_url_opt: Option<String>,
@@ -124,42 +96,23 @@ pub async fn handle_daemon(
         println!("🌐 IPv6 Dual-Stack: Đang lắng nghe tại \x1b[1;36m{}\x1b[0m", ipv6_addr);
     }
 
-    // 6. Xác định IP Public của node để công bố lên Rendezvous (Whitelist)
-    let resolved_ip = match public_ip_opt {
-        Some(ip) => ip,
-        None => detect_public_or_lan_ip().await,
-    };
-
-    let is_v6 = resolved_ip.contains(':');
-    let proto_prefix = if is_v6 { "ip6" } else { "ip4" };
-    let public_multiaddr: Multiaddr = format!("/{}/{}/tcp/{}/p2p/{}", proto_prefix, resolved_ip, port, service.local_peer_id()).parse()?;
-
-    if network::service::is_dialable_multiaddr(&public_multiaddr) {
-        println!("🌐 Địa chỉ IP Public công bố: \x1b[1;32m{}\x1b[0m ({})", resolved_ip, proto_prefix.to_uppercase());
+    // 6. Chế độ mạng Client (Zero-Heartbeat, định tuyến qua Relay)
+    if let Some(ip) = public_ip_opt {
+        let is_v6 = ip.contains(':');
+        let proto = if is_v6 { "IP6" } else { "IP4" };
+        println!("🌐 Địa chỉ IP Public công bố: \x1b[1;32m{}\x1b[0m ({})", ip, proto);
     } else {
-        println!("🔒 Node đang ở Private IP ({}), đăng ký sổ địa chỉ định tuyến qua Relay Circuit.", resolved_ip);
+        println!("🔒 Chế độ kết nối: \x1b[1;32mBảo mật sau NAT\x1b[0m (Định tuyến ẩn danh qua Relay Circuit)");
     }
 
-    // 7. Rendezvous Bootstrap, Heartbeat & Dynamic Peer Keeper
+    // 7. Rendezvous Bootstrap & Dynamic Peer Keeper (Client Zero-Heartbeat: Relay đại diện đăng ký)
     let rendezvous = RendezvousClient::new(&rendezvous_url);
     println!("📡 Rendezvous Server: \x1b[1;34m{}\x1b[0m", rendezvous_url);
 
-    let public_multiaddr: Multiaddr = format!("/{}/{}/tcp/{}/p2p/{}", proto_prefix, resolved_ip, port, service.local_peer_id()).parse()?;
-    
-    // Đăng ký Rendezvous với Service để tự động kích hoạt Immediate Heartbeat khi có Circuit
-    let _ = service.register_rendezvous(rendezvous.clone(), public_multiaddr.clone(), Some("VN".to_string())).await;
-
-    // Heartbeat định kỳ 30s và cập nhật linh hoạt Circuit Relay multiaddr
-    let _heartbeat_handle = rendezvous.start_dynamic_heartbeat_loop(
-        service.clone(),
-        public_multiaddr,
-        Some("VN".to_string()),
-    );
-
-    // Bootstrap peers ban đầu
+    // Bootstrap peers ban đầu từ Rendezvous
     let _ = service.bootstrap_from_rendezvous(&rendezvous, 20).await;
 
-    // Kích hoạt Dynamic Peer Keeper: Tự động tìm kiếm peer mới mỗi 15 giây và chủ động tạo kết nối Outbound 2 chiều
+    // Kích hoạt Dynamic Peer Keeper: Tự động tìm kiếm peer mới mỗi 15 giây qua GET /peers
     let _peer_keeper_handle = service.start_auto_discovery_loop(rendezvous.clone());
     info!("Đã kích hoạt Dynamic Peer Keeper (chu kỳ 15s tự động kết nối 2 chiều)");
 

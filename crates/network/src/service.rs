@@ -43,6 +43,7 @@ enum P2PCommand {
     },
     DistributeShards {
         shards: Vec<Shard>,
+        file_cid: Option<String>,
         respond_to: oneshot::Sender<Result<(), NetworkError>>,
     },
     FetchShardsParallel {
@@ -220,10 +221,15 @@ impl P2PService {
     }
 
     pub async fn distribute_shards(&self, shards: Vec<Shard>) -> Result<(), NetworkError> {
+        self.distribute_shards_with_file(shards, None).await
+    }
+
+    pub async fn distribute_shards_with_file(&self, shards: Vec<Shard>, file_cid: Option<String>) -> Result<(), NetworkError> {
         let (tx, rx) = oneshot::channel();
         self.command_tx
             .send(P2PCommand::DistributeShards {
                 shards,
+                file_cid,
                 respond_to: tx,
             })
             .await
@@ -629,15 +635,16 @@ impl P2PEventLoop {
                 let _ = self.swarm.behaviour_mut().kademlia.bootstrap();
                 let _ = respond_to.send(Ok(added));
             }
-            P2PCommand::DistributeShards { shards, respond_to } => {
-                // 1. Luôn lưu toàn bộ shards vào BlockStore cục bộ của chính uploader và công bố lên DHT
+            P2PCommand::DistributeShards { shards, file_cid, respond_to } => {
+                // 1. Luôn lưu toàn bộ shards vào BlockStore cục bộ của uploader kèm File_CID và công bố lên DHT
+                let f_cid = file_cid.as_deref().unwrap_or("default_file");
                 for shard in &shards {
-                    let _ = self.blockstore.put_shard(&shard.hash, &shard.data);
+                    let _ = self.blockstore.put_shard_with_file(&shard.hash, f_cid, &shard.data);
                     let key = RecordKey::new(&shard.hash.as_bytes());
                     let _ = self.swarm.behaviour_mut().kademlia.start_providing(key);
                 }
 
-                // 2. Lọc danh sách storage peers đang kết nối (loại trừ Relay nếu có nhiều peer)
+                // 2. Phân tán ngay 1 shard cho mỗi peer kết nối (load balancing, không dồn cục làm nghẽn Relay)
                 let storage_peers: Vec<PeerId> = self
                     .connected_peers
                     .iter()
@@ -651,20 +658,16 @@ impl P2PEventLoop {
                     storage_peers
                 };
 
-                // 3. Phân tán các bản sao Shards sang các peers
-                if !target_peers.is_empty() {
-                    let total_peers = target_peers.len();
-                    for (i, shard) in shards.into_iter().enumerate() {
-                        let target_peer = target_peers[i % total_peers];
+                if !target_peers.is_empty() && !shards.is_empty() {
+                    for (i, target_peer) in target_peers.iter().enumerate() {
+                        let shard = &shards[i % shards.len()];
                         let req = ShardRequest::Push(PushShard {
                             hash: shard.hash.clone(),
-                            file_cid: None,
-                            data: shard.data,
+                            file_cid: Some(f_cid.to_string()),
+                            data: shard.data.clone(),
                         });
-                        self.swarm
-                            .behaviour_mut()
-                            .request_response
-                            .send_request(&target_peer, req);
+                        let req_id = self.swarm.behaviour_mut().request_response.send_request(target_peer, req);
+                        self.pending_pushes.insert(req_id, (*target_peer, shard.hash.clone()));
                     }
                 }
 
@@ -936,37 +939,7 @@ impl P2PEventLoop {
                     println!("🎉 Đã đăng ký thành công Relay Circuit: \x1b[1;32m{}\x1b[0m", address);
                     info!("🎉 Đã đăng ký thành công Relay Circuit: {}", address);
 
-                    // 1. EVENT-DRIVEN IMMEDIATE HEARTBEAT: Bắn heartbeat ngay lập tức khi vừa có Circuit address!
-                    if let Some((client, direct_addr, region)) = &self.rendezvous_info {
-                        let client = client.clone();
-                        let peer_id_str = self.local_peer_id.to_string();
-                        let mut addrs = Vec::new();
-                        if is_dialable_multiaddr(direct_addr) {
-                            addrs.push(direct_addr.to_string());
-                        }
-
-                        for l in self.swarm.listeners() {
-                            let s = l.to_string();
-                            if s.contains("/p2p-circuit") {
-                                let formatted = if s.ends_with(&peer_id_str) {
-                                    s
-                                } else {
-                                    format!("{}/p2p/{}", s.trim_end_matches('/'), peer_id_str)
-                                };
-                                if !addrs.contains(&formatted) {
-                                    addrs.push(formatted);
-                                }
-                            }
-                        }
-
-                        let region = region.clone();
-                        tokio::spawn(async move {
-                            debug!("⚡ Bắn Heartbeat tức thì lên Rendezvous với multiaddrs: {:?}", addrs);
-                            let _ = client.send_heartbeat(&peer_id_str, &addrs, region).await;
-                        });
-                    }
-
-                    // 2. KHI ĐÃ CÓ RESERVATION XÁC NHẬN: Nối cầu Circuit tới các Storage Peers!
+                    // KHI ĐÃ CÓ RESERVATION XÁC NHẬN: Nối cầu Circuit tới các Storage Peers!
                     for relay_addr in &self.known_relays {
                         if let Some(relay_id) = extract_peer_id(relay_addr) {
                             let relay_with_id = ensure_relay_peer_id(relay_addr.clone(), &relay_id);
