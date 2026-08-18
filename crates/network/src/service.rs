@@ -719,6 +719,10 @@ impl P2PEventLoop {
                     collected_indices.insert(s.index);
                 }
 
+                let needed = target_count.saturating_sub(collected_shards.len());
+                let query_batch_size = (needed + 10).min(remaining_hashes.len());
+                let hashes_to_query = remaining_hashes[..query_batch_size].to_vec();
+
                 self.fetch_sessions.insert(
                     session_id,
                     PendingFetchRequest {
@@ -730,8 +734,20 @@ impl P2PEventLoop {
                     },
                 );
 
-                for hash in remaining_hashes {
-                    for peer in &storage_peers {
+                for hash in &hashes_to_query {
+                    let known_holders: Vec<PeerId> = self.peer_shards
+                        .iter()
+                        .filter(|(p, s)| storage_peers.contains(p) && s.contains_key(hash))
+                        .map(|(p, _)| *p)
+                        .collect();
+
+                    let target_peers = if !known_holders.is_empty() {
+                        known_holders
+                    } else {
+                        storage_peers.clone()
+                    };
+
+                    for peer in &target_peers {
                         let req = ShardRequest::Pull(PullShard { hash: hash.clone() });
                         let req_id = self
                             .swarm
