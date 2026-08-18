@@ -1138,11 +1138,20 @@ impl P2PEventLoop {
                         .request_response
                         .send_response(channel, ShardResponse::Ack);
 
-                    // Kiểm tra và thu hồi Shard thừa định lượng theo File (> 50 shards của file trên toàn mạng)
+                    // Thu hồi Shard thừa định lượng theo từng File (> 50 shards của file trên toàn mạng)
                     if let Ok(my_hashes) = self.blockstore.list_shard_hashes() {
-                        let mut quota_guard = self.quota_manager.write().await;
+                        // 1. Nhóm các shard cục bộ theo file_cid
+                        let mut local_file_shards: HashMap<String, Vec<String>> = HashMap::new();
                         for hash in my_hashes {
                             let file_cid = self.blockstore.get_file_cid_for_shard(&hash).unwrap_or(None).unwrap_or_else(|| "default_file".to_string());
+                            local_file_shards.entry(file_cid).or_default().push(hash);
+                        }
+
+                        let mut quota_guard = self.quota_manager.write().await;
+                        let my_pid_str = self.local_peer_id.to_string();
+
+                        for (file_cid, shards) in local_file_shards {
+                            // Đếm tổng số shard của file này trên toàn mạng từ bản tin broadcast
                             let total_file_shards: usize = broadcast
                                 .nodes
                                 .iter()
@@ -1150,38 +1159,79 @@ impl P2PEventLoop {
                                 .sum();
 
                             if total_file_shards > 50 {
-                                let redundant_count = total_file_shards - 50;
-                                let mut nodes_with_file: Vec<&crate::protocol::NodeStateReport> = broadcast
+                                let total_excess = total_file_shards - 50;
+
+                                // Lọc danh sách các node đang giữ file này có R > 4.0
+                                let mut candidate_nodes: Vec<&crate::protocol::NodeStateReport> = broadcast
                                     .nodes
                                     .iter()
-                                    .filter(|n| n.held_shards.iter().any(|s| s.file_cid == file_cid))
+                                    .filter(|n| n.held_shards.iter().any(|s| s.file_cid == file_cid) && n.r_ratio.unwrap_or(0.0) > 4.0)
                                     .collect();
 
-                                nodes_with_file.sort_by(|a, b| {
+                                if candidate_nodes.is_empty() {
+                                    continue;
+                                }
+
+                                // Sắp xếp node có R cao nhất lên đầu (gánh prune trước)
+                                candidate_nodes.sort_by(|a, b| {
                                     let r_a = a.r_ratio.unwrap_or(0.0);
                                     let r_b = b.r_ratio.unwrap_or(0.0);
                                     r_b.partial_cmp(&r_a).unwrap_or(std::cmp::Ordering::Equal)
                                 });
 
-                                let top_full_nodes: Vec<&crate::protocol::NodeStateReport> = nodes_with_file
-                                    .into_iter()
-                                    .take(redundant_count)
-                                    .filter(|n| n.r_ratio.unwrap_or(0.0) > 4.5)
-                                    .collect();
+                                // Phân bổ công bằng quota prune cho từng node
+                                let mut remaining_excess = total_excess;
+                                let mut my_prune_quota = 0;
 
-                                let am_in_top = top_full_nodes.iter().any(|n| n.peer_id == self.local_peer_id.to_string());
-                                if am_in_top {
-                                    if let Ok(Some(data)) = self.blockstore.get_shard(&hash) {
-                                        let shard_len = data.len() as u64;
-                                        if quota_guard.my_uploaded_bytes > 0 {
-                                            let next_stored = quota_guard.stored_shard_bytes.saturating_sub(shard_len);
-                                            let next_r = next_stored as f64 / quota_guard.my_uploaded_bytes as f64;
-                                            if next_r >= 4.0 {
-                                                let _ = self.blockstore.delete_shard(&hash);
-                                                quota_guard.record_pruned_shard(shard_len);
-                                                info!("🗑️ [File Prune] Đã tự động thu hồi shard thừa {} của file {} (toàn mạng có {} shards của file này, R_mới={:.3})", &hash[..12], &file_cid[..file_cid.len().min(12)], total_file_shards, next_r);
+                                for node in &candidate_nodes {
+                                    if remaining_excess == 0 {
+                                        break;
+                                    }
+                                    let node_file_shard_count = node.held_shards.iter().filter(|s| s.file_cid == file_cid).count();
+                                    let node_share = (total_excess as f64 / candidate_nodes.len() as f64).ceil() as usize;
+                                    let prune_for_this_node = remaining_excess.min(node_share).min(node_file_shard_count.saturating_sub(10));
+
+                                    if node.peer_id == my_pid_str {
+                                        my_prune_quota = prune_for_this_node;
+                                    }
+                                    remaining_excess = remaining_excess.saturating_sub(prune_for_this_node);
+                                }
+
+                                if my_prune_quota > 0 {
+                                    let short_cid = if file_cid.len() > 12 { &file_cid[..12] } else { &file_cid };
+                                    let current_r = quota_guard.current_r_ratio().unwrap_or(0.0);
+                                    info!("🗑️ [File Prune] File {}: Toàn mạng có {} shards (dư {}), dự kiến thu hồi {} shards trên node này (R={:.3})...", 
+                                        short_cid, total_file_shards, total_excess, my_prune_quota, current_r);
+
+                                    let mut pruned_count = 0;
+                                    let mut final_r = current_r;
+
+                                    for hash in shards {
+                                        if pruned_count >= my_prune_quota {
+                                            break;
+                                        }
+
+                                        if let Ok(Some(data)) = self.blockstore.get_shard(&hash) {
+                                            let shard_len = data.len() as u64;
+                                            if quota_guard.my_uploaded_bytes > 0 {
+                                                let next_stored = quota_guard.stored_shard_bytes.saturating_sub(shard_len);
+                                                let next_r = next_stored as f64 / quota_guard.my_uploaded_bytes as f64;
+                                                if next_r >= 4.0 {
+                                                    let _ = self.blockstore.delete_shard(&hash);
+                                                    quota_guard.record_pruned_shard(shard_len);
+                                                    pruned_count += 1;
+                                                    final_r = next_r;
+                                                }
                                             }
                                         }
+                                    }
+
+                                    if pruned_count > 0 {
+                                        if let Some(home) = dirs::home_dir() {
+                                            let quota_file = home.join(".p2pdrive").join("quota.json");
+                                            let _ = quota_guard.save_to_file(&quota_file);
+                                        }
+                                        info!("✅ [File Prune] Đã hoàn tất thu hồi {} shards của file {} (R_mới={:.3}).", pruned_count, short_cid, final_r);
                                     }
                                 }
                             }
