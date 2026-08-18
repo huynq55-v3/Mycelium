@@ -420,11 +420,11 @@ impl P2PEventLoop {
             return;
         }
 
-        // 3. Cơ chế Round-Robin Chuẩn mực: Mỗi chu kỳ chỉ gửi ĐÚNG 1 SHARD cho mỗi Peer đang đói (R < 4.5)
+        // 3. Cơ chế Round-Robin Chuẩn mực: Mỗi chu kỳ gửi ĐÚNG 1 SHARD cho Peer (ưu tiên R < 4.5, hoặc Mesh Healing khi thiếu bản sao)
         for &peer in &storage_peers {
             let peer_r = self.peer_r_ratios.get(&peer).copied().unwrap_or(0.0);
-            if peer_r >= 4.5 {
-                // Peer này đã no nê đạt trần cân bằng (R >= 4.5), không cần bơm thêm
+            if peer_r >= 5.0 {
+                // Peer này đã chạm trần cứng (R >= 5.0), chắc chắn sẽ từ chối
                 continue;
             }
 
@@ -439,10 +439,26 @@ impl P2PEventLoop {
                 let already_has = self.peer_shards.get(&peer).map(|s| s.contains_key(hash)).unwrap_or(false);
                 let already_in_flight = self.pending_pushes.values().any(|(p, h, _)| p == &peer && h == hash);
                 if !already_has && !already_in_flight {
+                    let file_cid = self.blockstore.get_file_cid_for_shard(hash).unwrap_or(None);
+                    let current_file_cid = file_cid.unwrap_or_else(|| "default_file".to_string());
+
+                    // Tính tổng số shard của file này đang online (local + các peer đang kết nối)
+                    let my_file_shards = self.blockstore.count_shards_for_file(&current_file_cid).unwrap_or(0);
+                    let peers_file_shards: usize = self.peer_shards
+                        .iter()
+                        .filter(|(p, _)| self.connected_peers.contains(p))
+                        .map(|(_, s)| s.values().filter(|cid| *cid == &current_file_cid).count())
+                        .sum();
+                    let total_online = my_file_shards + peers_file_shards;
+
+                    let is_under_replicated = total_online < 40;
+                    if peer_r >= 4.5 && !is_under_replicated {
+                        // File đã đủ bản sao an toàn (>= 40) và peer đã no nê (R >= 4.5), không cần bơm
+                        continue;
+                    }
+
                     if let Ok(Some(data)) = self.blockstore.get_shard(hash) {
                         let shard_kb = data.len() as f64 / 1024.0;
-                        let file_cid = self.blockstore.get_file_cid_for_shard(hash).unwrap_or(None);
-                        let current_file_cid = file_cid.unwrap_or_else(|| "default_file".to_string());
                         let req = ShardRequest::Push(crate::protocol::PushShard {
                             hash: hash.clone(),
                             file_cid: Some(current_file_cid.clone()),
@@ -452,7 +468,11 @@ impl P2PEventLoop {
                             .map(|s| s.values().filter(|cid| *cid == &current_file_cid).count())
                             .unwrap_or(0);
                         let short_cid = if current_file_cid.len() > 12 { &current_file_cid[..12] } else { &current_file_cid };
-                        info!("📤 [Mesh Diffusion] Đang gửi 1 shard {}... ({:.2} KB) sang peer {} (R={:.2}, hiện giữ {} shards của file {})", &hash[..12], shard_kb, peer, peer_r, held_count, short_cid);
+                        if is_under_replicated {
+                            info!("🩺 [Mesh Healing] File {} thiếu bản sao (chỉ có {} shards online), ưu tiên gửi shard {}... ({:.2} KB) sang peer {} (R={:.2}, hiện giữ {} shards)", short_cid, total_online, &hash[..12], shard_kb, peer, peer_r, held_count);
+                        } else {
+                            info!("📤 [Mesh Diffusion] Đang gửi 1 shard {}... ({:.2} KB) sang peer {} (R={:.2}, hiện giữ {} shards của file {})", &hash[..12], shard_kb, peer, peer_r, held_count, short_cid);
+                        }
                         let req_id = self.swarm.behaviour_mut().request_response.send_request(&peer, req);
                         self.pending_pushes.insert(req_id, (peer, hash.clone(), current_file_cid));
                         break; // Mỗi chu kỳ chỉ gửi đúng 1 shard cho peer này
