@@ -1239,10 +1239,28 @@ impl P2PEventLoop {
                                     info!("🗑️ [File Prune] File {}: Toàn mạng có {} shards (dư {}), dự kiến thu hồi {} shards trên node này (R={:.3})...", 
                                         short_cid, total_file_shards, total_excess, my_prune_quota, current_r);
 
+                                    // Đếm số lượng bản sao toàn mạng cho từng shard hash để ưu tiên xóa shard trùng lặp trước
+                                    let mut shard_replica_count: HashMap<String, usize> = HashMap::new();
+                                    for node in &broadcast.nodes {
+                                        for s in &node.held_shards {
+                                            if s.file_cid == file_cid {
+                                                *shard_replica_count.entry(s.shard_hash.clone()).or_insert(0) += 1;
+                                            }
+                                        }
+                                    }
+
+                                    // Sắp xếp ưu tiên: Shard nào có nhiều bản sao trùng lặp nhất trên toàn mạng -> Thu hồi trước
+                                    let mut sorted_shards = shards.clone();
+                                    sorted_shards.sort_by(|a, b| {
+                                        let count_a = shard_replica_count.get(a).cloned().unwrap_or(1);
+                                        let count_b = shard_replica_count.get(b).cloned().unwrap_or(1);
+                                        count_b.cmp(&count_a)
+                                    });
+
                                     let mut pruned_count = 0;
                                     let mut final_r = current_r;
 
-                                    for hash in shards {
+                                    for hash in sorted_shards {
                                         if pruned_count >= my_prune_quota {
                                             break;
                                         }
