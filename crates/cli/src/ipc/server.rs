@@ -543,7 +543,7 @@ impl IpcServer {
         network::VirtualTree::new(&self.identity.to_did())
     }
 
-    fn save_vfs_tree(&self, tree: &network::VirtualTree) -> Result<()> {
+    async fn save_vfs_tree(&self, tree: &network::VirtualTree) -> Result<()> {
         let path = self.vfs_tree_path();
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
@@ -551,7 +551,20 @@ impl IpcServer {
         let enc_bytes = tree
             .encrypt_tree(&self.identity)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        fs::write(path, enc_bytes)?;
+        fs::write(&path, &enc_bytes)?;
+
+        // Đồng bộ VirtualTree Root vào BlockStore & Phát tán lên P2P Grid để hỗ trợ khôi phục khi mất máy
+        let vfs_root_hash = erasure_codec::sha256_hex(format!("vfs_root:{}", self.identity.to_did()).as_bytes());
+        let file_cid = format!("vfs_root_{}", self.identity.to_did());
+        let _ = self.blockstore.put_shard_with_file(&vfs_root_hash, &file_cid, &enc_bytes);
+
+        let root_shard = erasure_codec::Shard {
+            index: 0,
+            data: enc_bytes,
+            hash: vfs_root_hash,
+        };
+        let _ = self.service.distribute_shards_with_file(vec![root_shard], Some(file_cid)).await;
+
         Ok(())
     }
 
@@ -806,7 +819,7 @@ impl IpcServer {
             }
         }
 
-        self.save_vfs_tree(&tree)?;
+        self.save_vfs_tree(&tree).await?;
         let r_ratio = self.quota_manager.read().await.current_r_ratio();
 
         Self::send_response(
@@ -854,7 +867,7 @@ impl IpcServer {
                     network::VfsEntry::Dir(_) => 0,
                 };
 
-                self.save_vfs_tree(&tree)?;
+                self.save_vfs_tree(&tree).await?;
                 let r_ratio = self.quota_manager.read().await.current_r_ratio();
 
                 Self::send_response(
@@ -1002,38 +1015,82 @@ impl IpcServer {
             _ => self.identity.clone(),
         };
 
-        // 2. Đọc file vfs_tree.enc
-        let tree_file = match vfs_path {
-            Some(p) => PathBuf::from(p),
-            None => self.vfs_tree_path(),
-        };
+        // 2. Tìm và nạp cây thư mục VirtualTree
+        let mut decrypted_tree: Option<network::VirtualTree> = None;
 
-        if !tree_file.exists() {
-            Self::send_response(
-                writer,
-                &IpcResponse::Error(format!("Không tìm thấy file cây thư mục ảo tại {:?}", tree_file)),
-            ).await?;
-            return Ok(());
-        }
-
-        let encrypted_vfs_bytes = match fs::read(&tree_file) {
-            Ok(bytes) => bytes,
-            Err(e) => {
+        // 2a. Nếu người dùng chỉ định rõ file --vfs-path
+        if let Some(ref p) = vfs_path {
+            let tree_file = PathBuf::from(p);
+            if !tree_file.exists() {
                 Self::send_response(
                     writer,
-                    &IpcResponse::Error(format!("Không thể đọc file vfs_tree.enc: {e}")),
+                    &IpcResponse::Error(format!("Không tìm thấy file cây thư mục ảo tại {:?}", tree_file)),
                 ).await?;
                 return Ok(());
             }
-        };
+            if let Ok(bytes) = fs::read(&tree_file) {
+                match network::VirtualTree::decrypt_tree(&bytes, &identity) {
+                    Ok(t) => decrypted_tree = Some(t),
+                    Err(e) => {
+                        Self::send_response(
+                            writer,
+                            &IpcResponse::Error(format!("Giải mã file cây thư mục {:?} thất bại: {}", tree_file, e)),
+                        ).await?;
+                        return Ok(());
+                    }
+                }
+            }
+        }
 
-        // 3. Giải mã VirtualTree bằng Identity
-        let tree = match network::VirtualTree::decrypt_tree(&encrypted_vfs_bytes, &identity) {
-            Ok(t) => t,
-            Err(e) => {
+        // 2b. Thử giải mã file vfs_tree.enc cục bộ của Daemon nếu chưa có
+        if decrypted_tree.is_none() {
+            let local_tree_file = self.vfs_tree_path();
+            if local_tree_file.exists() {
+                if let Ok(bytes) = fs::read(&local_tree_file) {
+                    if let Ok(t) = network::VirtualTree::decrypt_tree(&bytes, &identity) {
+                        decrypted_tree = Some(t);
+                    }
+                }
+            }
+        }
+
+        // 2c. Tìm trong BlockStore cục bộ theo Root Hash của DID
+        let vfs_root_hash = erasure_codec::sha256_hex(format!("vfs_root:{}", identity.to_did()).as_bytes());
+        if decrypted_tree.is_none() {
+            if let Ok(Some(bytes)) = self.blockstore.get_shard(&vfs_root_hash) {
+                if let Ok(t) = network::VirtualTree::decrypt_tree(&bytes, &identity) {
+                    decrypted_tree = Some(t);
+                }
+            }
+        }
+
+        // 2d. Kéo từ mạng P2P Swarm nếu máy này chưa có cây thư mục của DID
+        if decrypted_tree.is_none() {
+            Self::send_response(
+                writer,
+                &IpcResponse::Progress {
+                    step: "fetching_vfs_tree".to_string(),
+                    current: 0,
+                    total: 1,
+                    message: format!("Đang tìm kiếm và kéo cây thư mục ảo cho DID {} từ mạng P2P Swarm...", identity.to_did()),
+                },
+            ).await?;
+
+            if let Ok(shards) = self.service.fetch_shards_parallel(vec![vfs_root_hash.clone()], 1).await {
+                if let Some(shard) = shards.first() {
+                    if let Ok(t) = network::VirtualTree::decrypt_tree(&shard.data, &identity) {
+                        decrypted_tree = Some(t);
+                    }
+                }
+            }
+        }
+
+        let tree = match decrypted_tree {
+            Some(t) => t,
+            None => {
                 Self::send_response(
                     writer,
-                    &IpcResponse::Error(format!("Giải mã VirtualTree thất bại! Khóa bí mật không khớp với danh tính đã mã hóa cây thư mục này ({e}).")),
+                    &IpcResponse::Error(format!("Không tìm thấy hoặc không thể giải mã cây thư mục ảo cho DID {}. Đảm bảo bạn dùng đúng khóa bí mật và node gốc đã từng commit dữ liệu lên mạng.", identity.to_did())),
                 ).await?;
                 return Ok(());
             }
@@ -1048,7 +1105,8 @@ impl IpcServer {
             return Ok(());
         }
 
-        let out_dir = PathBuf::from(&output_dir);
+        // 1. Output data phải được bọc trong folder root tên là MyceliumDrive nằm trong folder output
+        let out_dir = PathBuf::from(&output_dir).join("MyceliumDrive");
         let _ = fs::create_dir_all(&out_dir);
 
         let total_files = files.len();
@@ -1061,7 +1119,7 @@ impl IpcServer {
                 step: "dump_start".to_string(),
                 current: 0,
                 total: total_files as u64,
-                message: format!("Bắt đầu khôi phục {} tệp tin cho DID {}...", total_files, identity.to_did()),
+                message: format!("Bắt đầu khôi phục {} tệp tin vào {:?} cho DID {}...", total_files, out_dir, identity.to_did()),
             },
         ).await?;
 
@@ -1154,7 +1212,7 @@ impl IpcServer {
             &IpcResponse::DumpSuccess {
                 restored_files_count: restored_count,
                 total_bytes,
-                output_dir,
+                output_dir: out_dir.to_string_lossy().to_string(),
             },
         ).await?;
 
