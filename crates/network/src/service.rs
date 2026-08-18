@@ -539,11 +539,11 @@ impl P2PEventLoop {
                             continue;
                         }
 
-                        let addr_str = addr.to_string().to_lowercase();
-                        let is_relay_server = addr_str.contains("relay")
-                            && !addr_str.contains("/p2p-circuit/");
+                        let addr_str = addr.to_string();
+                        let is_circuit = addr_str.contains("/p2p-circuit/") || addr_str.contains("/p2p-circuit");
 
-                        if is_relay_server {
+                        if !is_circuit {
+                            // Địa chỉ công khai trực tiếp từ Rendezvous -> Đây là Relay Server
                             self.discovered_relays.insert(peer_id);
                             let relay_with_id = ensure_relay_peer_id(addr.clone(), &peer_id);
                             self.known_relays.insert(relay_with_id.clone());
@@ -579,7 +579,7 @@ impl P2PEventLoop {
                                 }
                             }
                         } else {
-                            // Đây là Storage Peer: Lưu địa chỉ vào danh bạ (dùng để tổng hợp) nhưng KHÔNG dial trực tiếp qua NAT Router.
+                            // Địa chỉ Circuit định tuyến qua Relay -> Đây là Storage Peer
                             self.known_peer_addrs
                                 .entry(peer_id)
                                 .or_default()
@@ -590,41 +590,9 @@ impl P2PEventLoop {
                                 .kademlia
                                 .add_address(&peer_id, addr.clone());
 
-                            if addr_str.contains("/p2p-circuit/") {
-                                if !self.connected_peers.contains(&peer_id) {
-                                    info!("⚡ Nối cầu Circuit từ Rendezvous tới Storage Peer: {} ({})", peer_id, addr);
-                                    let _ = self.swarm.dial(addr.clone());
-                                }
-                            } else {
-                                // Ghép với Relay đang có Reservation (đã kết nối thành công) để tạo Circuit Address
-                                let mut dialed = false;
-                                for relay_addr in &self.known_relays {
-                                    if let Some(relay_id) = extract_peer_id(relay_addr) {
-                                        if !self.reserved_relays.contains(&relay_id) {
-                                            continue; // Chỉ dùng Relay mà máy này đã đăng ký Reservation thành công
-                                        }
-                                        let relay_with_id = ensure_relay_peer_id(relay_addr.clone(), &relay_id);
-                                        let circuit_addr = relay_with_id
-                                            .with(libp2p::multiaddr::Protocol::P2pCircuit)
-                                            .with(libp2p::multiaddr::Protocol::P2p(peer_id));
-
-                                        self.known_peer_addrs
-                                            .entry(peer_id)
-                                            .or_default()
-                                            .insert(circuit_addr.clone());
-
-                                        self.swarm
-                                            .behaviour_mut()
-                                            .kademlia
-                                            .add_address(&peer_id, circuit_addr.clone());
-
-                                        if !self.connected_peers.contains(&peer_id) && !dialed {
-                                            info!("⚡ Nối cầu Circuit tới Storage Peer: {} ({})", peer_id, circuit_addr);
-                                            let _ = self.swarm.dial(circuit_addr);
-                                            dialed = true; // Chỉ dial 1 đường hầm ưu tiên, tránh dồn nhiều kết nối đồng thời gây tràn tài nguyên
-                                        }
-                                    }
-                                }
+                            if !self.connected_peers.contains(&peer_id) {
+                                info!("⚡ Nối cầu Circuit từ Rendezvous tới Storage Peer: {} ({})", peer_id, addr);
+                                let _ = self.swarm.dial(addr.clone());
                             }
                         }
 
@@ -836,6 +804,13 @@ impl P2PEventLoop {
                 peer_id, error, ..
             } => {
                 warn!("⚠️ [LỖI KẾT NỐI OUTBOUND] Không thể kết nối tới peer {:?}: {}", peer_id, error);
+                if let Some(pid) = peer_id {
+                    self.discovered_relays.remove(&pid);
+                    self.reserved_relays.remove(&pid);
+                    self.known_peer_addrs.remove(&pid);
+                    self.known_relays.retain(|r| extract_peer_id(r) != Some(pid));
+                    self.swarm.behaviour_mut().kademlia.remove_peer(&pid);
+                }
             }
             SwarmEvent::IncomingConnectionError {
                 send_back_addr,
