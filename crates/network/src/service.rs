@@ -1234,7 +1234,7 @@ impl P2PEventLoop {
                         if *accepted {
                             self.peer_shards.entry(target_peer).or_default().insert(hash);
                             let count = self.peer_shards.get(&target_peer).map(|s| s.len()).unwrap_or(0);
-                            info!("✅ [Mesh Diffusion] Peer {} đã chấp nhận và lưu trữ shard cache! (Hiện giữ: {}/20 shards)", target_peer, count);
+                            info!("✅ [Mesh Diffusion] Peer {} đã chấp nhận và lưu trữ shard cache! (Tổng shards đang giữ: {})", target_peer, count);
                         } else {
                             // Ghi nhận shard này đã xử lý với peer để không gửi lặp lại
                             self.peer_shards.entry(target_peer).or_default().insert(hash);
