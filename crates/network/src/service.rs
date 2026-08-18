@@ -299,6 +299,7 @@ struct P2PEventLoop {
     connected_peers: HashSet<PeerId>,
     discovered_relays: HashSet<PeerId>,
     reserved_relays: HashSet<PeerId>,
+    pending_reservations: HashSet<PeerId>,
     known_relays: HashSet<Multiaddr>,
     known_peer_addrs: HashMap<PeerId, HashSet<Multiaddr>>,
     pending_fetches: HashMap<request_response::OutboundRequestId, usize>,
@@ -327,6 +328,7 @@ impl P2PEventLoop {
             connected_peers: HashSet::new(),
             discovered_relays: HashSet::new(),
             reserved_relays: HashSet::new(),
+            pending_reservations: HashSet::new(),
             known_relays: HashSet::new(),
             known_peer_addrs: HashMap::new(),
             pending_fetches: HashMap::new(),
@@ -763,27 +765,6 @@ impl P2PEventLoop {
                             .insert(address.clone());
                     }
                 }
-
-                // Khi đã kết nối thành công tới peer, nếu peer này là Relay và chưa tạo reservation:
-                let is_potential_relay = self.discovered_relays.contains(&peer_id);
-
-                if is_potential_relay {
-                    let relay_addr_base = self.known_peer_addrs.get(&peer_id)
-                        .and_then(|addrs| addrs.iter().find(|a| !a.to_string().contains("/p2p-circuit")).cloned());
-
-                    if let Some(base_addr) = relay_addr_base {
-                        let relay_with_id = ensure_relay_peer_id(base_addr, &peer_id);
-                        self.known_relays.insert(relay_with_id.clone());
-
-                        if !self.reserved_relays.contains(&peer_id) {
-                            let circuit_addr = relay_with_id.with(libp2p::multiaddr::Protocol::P2pCircuit);
-                            info!("🔗 Đang đăng ký Relay Circuit Reservation tại: {}", circuit_addr);
-                            if let Err(e) = self.swarm.listen_on(circuit_addr) {
-                                warn!("❌ Lỗi đăng ký circuit_addr trên {}: {}", peer_id, e);
-                            }
-                        }
-                    }
-                }
             }
             SwarmEvent::OutgoingConnectionError {
                 peer_id, error, ..
@@ -875,11 +856,16 @@ impl P2PEventLoop {
                             let relay_with_id = ensure_relay_peer_id(base_addr, &peer_id);
                             self.known_relays.insert(relay_with_id.clone());
 
-                            if !self.reserved_relays.contains(&peer_id) {
+                            if !self.reserved_relays.contains(&peer_id) && !self.pending_reservations.contains(&peer_id) {
                                 let circuit_addr = relay_with_id.with(libp2p::multiaddr::Protocol::P2pCircuit);
                                 info!("🔗 [Identify] Đang đăng ký Relay Circuit Reservation tại: {}", circuit_addr);
-                                if let Err(e) = self.swarm.listen_on(circuit_addr) {
-                                    warn!("❌ [Identify] Lỗi đăng ký circuit_addr trên Relay {}: {}", peer_id, e);
+                                match self.swarm.listen_on(circuit_addr) {
+                                    Ok(_) => {
+                                        self.pending_reservations.insert(peer_id);
+                                    }
+                                    Err(e) => {
+                                        warn!("❌ [Identify] Lỗi đăng ký circuit_addr trên Relay {}: {}", peer_id, e);
+                                    }
                                 }
                             }
                         } else {
@@ -895,6 +881,7 @@ impl P2PEventLoop {
                     info!("🎉 Đã đăng ký thành công Relay Circuit: {}", address);
 
                     if let Some(relay_id) = extract_peer_id(&address) {
+                        self.pending_reservations.remove(&relay_id);
                         self.reserved_relays.insert(relay_id);
                     }
 
