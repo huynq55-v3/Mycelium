@@ -1171,6 +1171,15 @@ impl IpcServer {
                 Ok(s) => s,
                 Err(e) => {
                     warn!("Không thể kéo đủ shards cho file {}: {}", vfs_path, e);
+                    Self::send_response(
+                        writer,
+                        &IpcResponse::Progress {
+                            step: "file_error".to_string(),
+                            current: (idx + 1) as u64,
+                            total: total_files as u64,
+                            message: format!("⚠️ Không thể kéo đủ {} shards cho {} ({})", file_node.k_data_shards, vfs_path, e),
+                        },
+                    ).await?;
                     continue;
                 }
             };
@@ -1196,6 +1205,15 @@ impl IpcServer {
                 Ok(data) => data,
                 Err(e) => {
                     warn!("Lỗi decode Reed-Solomon cho file {}: {}", vfs_path, e);
+                    Self::send_response(
+                        writer,
+                        &IpcResponse::Progress {
+                            step: "file_error".to_string(),
+                            current: (idx + 1) as u64,
+                            total: total_files as u64,
+                            message: format!("⚠️ Lỗi giải mã Reed-Solomon cho {}: {}", vfs_path, e),
+                        },
+                    ).await?;
                     continue;
                 }
             };
@@ -1216,6 +1234,15 @@ impl IpcServer {
                 Ok(d) => d,
                 Err(e) => {
                     warn!("Lỗi giải mã AES-GCM cho file {}: {}", vfs_path, e);
+                    Self::send_response(
+                        writer,
+                        &IpcResponse::Progress {
+                            step: "file_error".to_string(),
+                            current: (idx + 1) as u64,
+                            total: total_files as u64,
+                            message: format!("⚠️ Lỗi giải mã AES-GCM cho {}: {}", vfs_path, e),
+                        },
+                    ).await?;
                     continue;
                 }
             };
@@ -1234,6 +1261,14 @@ impl IpcServer {
                     total_bytes += decrypted_data.len() as u64;
                 }
             }
+        }
+
+        if restored_count == 0 {
+            Self::send_response(
+                writer,
+                &IpcResponse::Error("Không thể khôi phục tệp tin nào. Vui lòng đảm bảo các Storage Peer đang giữ shards đang online và kết nối tới mạng Swarm.".to_string()),
+            ).await?;
+            return Ok(());
         }
 
         Self::send_response(
