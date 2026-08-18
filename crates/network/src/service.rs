@@ -313,7 +313,7 @@ struct P2PEventLoop {
     pending_reservations: HashSet<PeerId>,
     known_relays: HashSet<Multiaddr>,
     known_peer_addrs: HashMap<PeerId, HashSet<Multiaddr>>,
-    pending_fetches: HashMap<request_response::OutboundRequestId, usize>,
+    pending_fetches: HashMap<request_response::OutboundRequestId, (usize, String)>,
     pending_pushes: HashMap<request_response::OutboundRequestId, (PeerId, String, String)>,
     peer_shards: HashMap<PeerId, HashMap<String, String>>,
     peer_r_ratios: HashMap<PeerId, f64>,
@@ -765,7 +765,7 @@ impl P2PEventLoop {
                             .behaviour_mut()
                             .request_response
                             .send_request(peer, req);
-                        self.pending_fetches.insert(req_id, session_id);
+                        self.pending_fetches.insert(req_id, (session_id, hash.clone()));
                     }
                 }
             }
@@ -1372,17 +1372,25 @@ impl P2PEventLoop {
                     }
                 }
 
-                if let Some(session_id) = self.pending_fetches.remove(&request_id) {
+                if let Some((session_id, requested_hash)) = self.pending_fetches.remove(&request_id) {
                     if let ShardResponse::Pull(PullResponse { data: Some(data) }) = response {
                         if let Some(session) = self.fetch_sessions.get_mut(&session_id) {
-                            let hash = erasure_codec::sha256_hex(&data);
-                            if let Some(&idx) = session.hashes_map.get(&hash) {
+                            let computed_hash = erasure_codec::sha256_hex(&data);
+                            let matched_hash = if session.hashes_map.contains_key(&computed_hash) {
+                                computed_hash
+                            } else if session.hashes_map.contains_key(&requested_hash) {
+                                requested_hash
+                            } else {
+                                String::new()
+                            };
+
+                            if let Some(&idx) = session.hashes_map.get(&matched_hash) {
                                 if !session.collected_indices.contains(&idx) {
                                     session.collected_indices.insert(idx);
                                     session.collected_shards.push(Shard {
                                         index: idx,
                                         data,
-                                        hash,
+                                        hash: matched_hash,
                                     });
 
                                     if session.collected_shards.len() >= session.target_count {
@@ -1399,7 +1407,7 @@ impl P2PEventLoop {
                         }
                     } else {
                         // Peer không có shard này
-                        let has_remaining = self.pending_fetches.values().any(|&sid| sid == session_id);
+                        let has_remaining = self.pending_fetches.values().any(|(sid, _)| *sid == session_id);
                         if !has_remaining {
                             if let Some(session) = self.fetch_sessions.remove(&session_id) {
                                 if session.collected_shards.len() >= session.target_count {
@@ -1418,8 +1426,8 @@ impl P2PEventLoop {
             request_response::Event::OutboundFailure { peer, request_id, error, .. } => {
                 warn!("⚠️ [Mesh Diffusion] Lỗi gửi yêu cầu Shard sang peer {} (request_id={}): {:?}", peer, request_id, error);
                 self.pending_pushes.remove(&request_id);
-                if let Some(session_id) = self.pending_fetches.remove(&request_id) {
-                    let has_remaining = self.pending_fetches.values().any(|&sid| sid == session_id);
+                if let Some((session_id, _)) = self.pending_fetches.remove(&request_id) {
+                    let has_remaining = self.pending_fetches.values().any(|(sid, _)| *sid == session_id);
                     if !has_remaining {
                         if let Some(session) = self.fetch_sessions.remove(&session_id) {
                             if session.collected_shards.len() >= session.target_count {
