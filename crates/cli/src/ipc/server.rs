@@ -1186,7 +1186,7 @@ impl IpcServer {
 
             let manifest = erasure_codec::FileManifest {
                 file_name: file_node.name.clone(),
-                original_size: file_node.size as usize,
+                original_size: file_node.size as usize + core_crypto::MIN_CIPHER_LEN,
                 original_hash: String::new(),
                 k_data_shards: file_node.k_data_shards,
                 n_total_shards: file_node.n_total_shards,

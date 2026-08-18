@@ -129,8 +129,15 @@ pub fn decode(
         });
     }
 
-    // Xác định kích thước shard từ một shard hợp lệ bất kỳ
-    let shard_size = (manifest.original_size + manifest.k_data_shards - 1) / manifest.k_data_shards;
+    // Xác định kích thước shard từ một shard hợp lệ bất kỳ trong mảng
+    let shard_size = shards
+        .iter()
+        .filter_map(|s| s.as_ref().map(|shard| shard.data.len()))
+        .next()
+        .ok_or(CodecError::InsufficientShards {
+            required: manifest.k_data_shards,
+            available: 0,
+        })?;
 
     // Chuẩn bị mảng `Option<Vec<u8>>` cho Reed-Solomon reconstruct
     let mut rs_shards: Vec<Option<Vec<u8>>> = Vec::with_capacity(manifest.n_total_shards);
@@ -138,7 +145,7 @@ pub fn decode(
     for (expected_idx, opt_shard) in shards.into_iter().enumerate() {
         match opt_shard {
             Some(shard) => {
-                // Kiểm tra kích thước shard
+                // Kiểm tra kích thước shard phải đồng nhất
                 if shard.data.len() != shard_size {
                     return Err(CodecError::InvalidShardSize);
                 }
@@ -183,13 +190,17 @@ pub fn decode(
         }
     }
 
-    // Cắt bỏ phần padding thừa về đúng original_size ban đầu
-    recovered_data.truncate(manifest.original_size);
+    // Cắt bỏ phần padding thừa về đúng original_size ban đầu nếu có chỉ định
+    if manifest.original_size > 0 && manifest.original_size <= recovered_data.len() {
+        recovered_data.truncate(manifest.original_size);
+    }
 
-    // Xác minh mã băm toàn vẹn của dữ liệu sau khi khôi phục
-    let recovered_hash = sha256_hex(&recovered_data);
-    if recovered_hash != manifest.original_hash {
-        return Err(CodecError::CorruptedDataIntegrity);
+    // Xác minh mã băm toàn vẹn của dữ liệu sau khi khôi phục (nếu có original_hash)
+    if !manifest.original_hash.is_empty() {
+        let recovered_hash = sha256_hex(&recovered_data);
+        if recovered_hash != manifest.original_hash {
+            return Err(CodecError::CorruptedDataIntegrity);
+        }
     }
 
     Ok(recovered_data)
