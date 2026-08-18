@@ -398,7 +398,7 @@ impl P2PEventLoop {
             .connected_peers
             .iter()
             .copied()
-            .filter(|p| !self.reserved_relays.contains(p) && !self.discovered_relays.contains(p))
+            .filter(|p| p != &self.local_peer_id && !self.reserved_relays.contains(p) && !self.discovered_relays.contains(p))
             .collect();
 
         if storage_peers.is_empty() {
@@ -603,11 +603,11 @@ impl P2PEventLoop {
                     .connected_peers
                     .iter()
                     .cloned()
-                    .filter(|p| !self.reserved_relays.contains(p) && !self.discovered_relays.contains(p))
+                    .filter(|p| p != &self.local_peer_id && !self.reserved_relays.contains(p) && !self.discovered_relays.contains(p))
                     .collect();
 
                 let target_peers = if storage_peers.is_empty() {
-                    self.connected_peers.iter().cloned().collect()
+                    self.connected_peers.iter().cloned().filter(|p| p != &self.local_peer_id).collect()
                 } else {
                     storage_peers
                 };
@@ -739,6 +739,10 @@ impl P2PEventLoop {
                 num_established,
                 ..
             } => {
+                if peer_id == self.local_peer_id {
+                    return;
+                }
+
                 if num_established.get() == 1 {
                     info!("🎉 Đã thiết lập kết nối 2 chiều thành công với peer: {}", peer_id);
                 } else {
