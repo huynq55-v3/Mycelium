@@ -979,34 +979,33 @@ impl IpcServer {
 
     async fn handle_dump<W: AsyncWriteExt + Unpin>(
         &self,
-        private_key: String,
+        private_key: Option<String>,
         output_dir: String,
         vfs_path: Option<String>,
         writer: &mut W,
     ) -> Result<()> {
-        // 1. Phục hồi Identity từ private_key (hex hoặc file)
-        let identity = if let Ok(id) = Identity::from_secret_hex(&private_key) {
-            id
-        } else if let Ok(id) = Identity::load_from_file(&PathBuf::from(&private_key)) {
-            id
-        } else {
-            Self::send_response(
-                writer,
-                &IpcResponse::Error("Khóa bí mật không hợp lệ (cần mã hex 64 ký tự hoặc đường dẫn file identity.json)".to_string()),
-            ).await?;
-            return Ok(());
+        // 1. Phục hồi Identity từ private_key (hex, file, hoặc mặc định từ Daemon)
+        let identity = match private_key {
+            Some(ref k) if !k.is_empty() => {
+                if let Ok(id) = Identity::from_secret_hex(k) {
+                    id
+                } else if let Ok(id) = Identity::load_from_file(&PathBuf::from(k)) {
+                    id
+                } else {
+                    Self::send_response(
+                        writer,
+                        &IpcResponse::Error(format!("Không thể nạp khóa bí mật từ: '{}'. Vui lòng kiểm tra chuỗi hex hoặc đường dẫn file identity.json hợp lệ.", k)),
+                    ).await?;
+                    return Ok(());
+                }
+            }
+            _ => self.identity.clone(),
         };
 
         // 2. Đọc file vfs_tree.enc
         let tree_file = match vfs_path {
             Some(p) => PathBuf::from(p),
-            None => {
-                if let Ok(dir) = AppConfig::config_dir() {
-                    dir.join("vfs_tree.enc")
-                } else {
-                    PathBuf::from("vfs_tree.enc")
-                }
-            }
+            None => self.vfs_tree_path(),
         };
 
         if !tree_file.exists() {
@@ -1034,7 +1033,7 @@ impl IpcServer {
             Err(e) => {
                 Self::send_response(
                     writer,
-                    &IpcResponse::Error(format!("Giải mã VirtualTree thất bại! Khóa bí mật không chính xác: {e}")),
+                    &IpcResponse::Error(format!("Giải mã VirtualTree thất bại! Khóa bí mật không khớp với danh tính đã mã hóa cây thư mục này ({e}).")),
                 ).await?;
                 return Ok(());
             }

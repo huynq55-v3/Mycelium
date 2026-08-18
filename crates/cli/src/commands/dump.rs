@@ -7,7 +7,7 @@ use crate::ipc::IpcClient;
 
 /// Xử lý lệnh `p2pdrive dump -k <private_key> -o <output_dir> [--vfs-path <path>]`.
 pub async fn handle_dump(
-    private_key: String,
+    private_key: Option<String>,
     output_dir: PathBuf,
     vfs_path: Option<PathBuf>,
 ) -> Result<()> {
@@ -15,15 +15,47 @@ pub async fn handle_dump(
     println!("       📦 KHÔI PHỤC TOÀN BỘ DỮ LIỆU MYCELIUM P2P DRIVE       ");
     println!("============================================================");
 
-    let output_dir_str = output_dir.to_string_lossy().to_string();
-    let vfs_path_str = vfs_path.map(|p| p.to_string_lossy().to_string());
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+
+    // Chuẩn hóa đường dẫn private_key nếu là file tương đối
+    let resolved_key = private_key.map(|k| {
+        let p = PathBuf::from(&k);
+        if p.exists() {
+            if let Ok(abs) = std::fs::canonicalize(&p) {
+                return abs.to_string_lossy().to_string();
+            }
+        }
+        let joined = cwd.join(&p);
+        if joined.exists() {
+            if let Ok(abs) = std::fs::canonicalize(&joined) {
+                return abs.to_string_lossy().to_string();
+            }
+            return joined.to_string_lossy().to_string();
+        }
+        k
+    });
+
+    let abs_output_dir = if output_dir.is_relative() {
+        cwd.join(&output_dir).to_string_lossy().to_string()
+    } else {
+        output_dir.to_string_lossy().to_string()
+    };
+
+    let abs_vfs_path = vfs_path.map(|p| {
+        if p.is_relative() {
+            cwd.join(&p).to_string_lossy().to_string()
+        } else {
+            p.to_string_lossy().to_string()
+        }
+    });
+
     let mut final_error = None;
 
     IpcClient::send_request(
         IpcRequest::Dump {
-            private_key,
-            output_dir: output_dir_str,
-            vfs_path: vfs_path_str,
+            private_key: resolved_key,
+            output_dir: abs_output_dir,
+            vfs_path: abs_vfs_path,
         },
         |response| match response {
             IpcResponse::Progress { message, .. } => {

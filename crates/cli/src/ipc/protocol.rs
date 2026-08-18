@@ -40,7 +40,7 @@ pub enum IpcRequest {
     },
     /// Yêu cầu khôi phục / dump toàn bộ dữ liệu người dùng từ Private Key
     Dump {
-        private_key: String,
+        private_key: Option<String>,
         output_dir: String,
         vfs_path: Option<String>,
     },

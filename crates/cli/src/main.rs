@@ -140,9 +140,9 @@ enum Commands {
 
     /// [CLIENT MODE] Khôi phục / Dump toàn bộ dữ liệu người dùng từ Private Key vào thư mục đầu ra
     Dump {
-        /// Khóa bí mật của người dùng (mã Hex 64 ký tự) hoặc đường dẫn file identity.json
+        /// Khóa bí mật của người dùng (mã Hex 64 ký tự) hoặc đường dẫn file identity.json (mặc định lấy identity hiện tại của Daemon)
         #[arg(short = 'k', long = "private-key", value_name = "PRIVATE_KEY")]
-        private_key: String,
+        private_key: Option<String>,
 
         /// Thư mục đích để lưu toàn bộ dữ liệu khôi phục (mặc định ./dump_output)
         #[arg(short = 'o', long = "output-dir", value_name = "OUTPUT_DIR", default_value = "./dump_output")]
