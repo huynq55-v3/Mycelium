@@ -555,7 +555,7 @@ impl P2PEventLoop {
                             self.discovered_relays.insert(peer_id);
                             let relay_with_id = ensure_relay_peer_id(addr.clone(), &peer_id);
                             self.known_relays.insert(relay_with_id.clone());
-                            info!("🔎 Phát hiện Relay Server trong mạng: {} ({})", peer_id, addr);
+                            info!("🔎 [Relay Discovery] Phát hiện Relay Server: {} ({})", peer_id, addr);
 
                             self.known_peer_addrs
                                 .entry(peer_id)
@@ -569,11 +569,12 @@ impl P2PEventLoop {
 
                             // Chủ động dial trực tiếp tới Relay Server nếu chưa kết nối
                             if !self.connected_peers.contains(&peer_id) {
-                                info!("🔄 Đang quay số kết nối tới Relay: {} ({})", peer_id, addr);
+                                info!("🔄 [Relay Connection] Đang quay số kết nối tới Relay Server: {} ({})", peer_id, addr);
                                 let _ = self.swarm.dial(addr.clone());
                             }
                         } else {
                             // Địa chỉ Circuit định tuyến qua Relay -> Đây là Storage Peer
+                            info!("🔎 [Storage Peer] Phát hiện Storage Peer trong mạng qua Circuit: {} ({})", peer_id, addr);
                             self.known_peer_addrs
                                 .entry(peer_id)
                                 .or_default()
@@ -585,7 +586,7 @@ impl P2PEventLoop {
                                 .add_address(&peer_id, addr.clone());
 
                             if !self.connected_peers.contains(&peer_id) {
-                                info!("⚡ Nối cầu Circuit từ Rendezvous tới Storage Peer: {} ({})", peer_id, addr);
+                                info!("⚡ [Storage Peer] Nối cầu Circuit tới Storage Peer: {} ({})", peer_id, addr);
                                 let _ = self.swarm.dial(addr.clone());
                             }
                         }
@@ -751,8 +752,13 @@ impl P2PEventLoop {
                     return;
                 }
 
+                let is_relay = self.discovered_relays.contains(&peer_id) || self.reserved_relays.contains(&peer_id);
                 if num_established.get() == 1 {
-                    info!("🎉 Đã thiết lập kết nối 2 chiều thành công với peer: {}", peer_id);
+                    if is_relay {
+                        info!("🤝 [Relay Connection] Đã kết nối thành công tới Relay Server: {}", peer_id);
+                    } else {
+                        info!("🎉 [Storage Peer] Đã thiết lập kết nối 2 chiều thành công với Storage Peer: {}", peer_id);
+                    }
                 } else {
                     debug!("🔗 Mở thêm luồng kết nối phụ (#{}) tới peer: {}", num_established, peer_id);
                 }
@@ -775,13 +781,21 @@ impl P2PEventLoop {
             SwarmEvent::OutgoingConnectionError {
                 peer_id, error, ..
             } => {
-                warn!("⚠️ [LỖI KẾT NỐI OUTBOUND] Không thể kết nối tới peer {:?}: {}", peer_id, error);
                 if let Some(pid) = peer_id {
+                    let is_relay = self.discovered_relays.contains(&pid) || self.reserved_relays.contains(&pid);
+                    if is_relay {
+                        warn!("⚠️ [Relay Connection] Không thể kết nối tới Relay Server {}: {}", pid, error);
+                    } else {
+                        warn!("⚠️ [Storage Peer] Không thể kết nối tới Storage Peer {}: {}", pid, error);
+                    }
                     self.discovered_relays.remove(&pid);
                     self.reserved_relays.remove(&pid);
+                    self.pending_reservations.remove(&pid);
                     self.known_peer_addrs.remove(&pid);
-                    self.known_relays.retain(|r| extract_peer_id(r) != Some(pid));
+                    self.known_relays.retain(|r| extract_relay_peer_id(r) != Some(pid));
                     self.swarm.behaviour_mut().kademlia.remove_peer(&pid);
+                } else {
+                    warn!("⚠️ [LỖI KẾT NỐI OUTBOUND] Không thể kết nối tới địa chỉ ngoại vi: {}", error);
                 }
             }
             SwarmEvent::IncomingConnectionError {
@@ -796,13 +810,24 @@ impl P2PEventLoop {
             }
             SwarmEvent::Dialing { peer_id, .. } => {
                 if let Some(pid) = peer_id {
-                    info!("📞 Đang thực hiện dial tới peer: {}", pid);
+                    let is_relay = self.discovered_relays.contains(&pid) || self.reserved_relays.contains(&pid);
+                    if is_relay {
+                        info!("📞 [Relay Connection] Đang quay số kết nối tới Relay Server: {}", pid);
+                    } else {
+                        info!("📞 [Storage Peer] Đang quay số kết nối tới Storage Peer: {}", pid);
+                    }
                 }
             }
             SwarmEvent::ConnectionClosed { peer_id, .. } => {
-                info!("Ngắt kết nối với peer: {}", peer_id);
+                let is_relay = self.discovered_relays.contains(&peer_id) || self.reserved_relays.contains(&peer_id);
+                if is_relay {
+                    info!("👋 [Relay Connection] Đã ngắt kết nối với Relay Server: {}", peer_id);
+                } else {
+                    info!("👋 [Storage Peer] Đã ngắt kết nối với Storage Peer: {}", peer_id);
+                }
                 self.connected_peers.remove(&peer_id);
                 self.reserved_relays.remove(&peer_id);
+                self.pending_reservations.remove(&peer_id);
             }
             SwarmEvent::Behaviour(MyceliumBehaviourEvent::Mdns(mdns_event)) => match mdns_event {
                 MdnsEvent::Discovered(list) => {
@@ -846,7 +871,7 @@ impl P2PEventLoop {
 
                     if is_relay {
                         self.discovered_relays.insert(peer_id);
-                        info!("🔎 [Identify] Xác nhận peer {} là Relay Server (protocol={}, agent={})", 
+                        info!("🔎 [Relay Identify] Xác nhận peer {} là Relay Server (protocol={}, agent={})", 
                             peer_id, info.protocol_version, info.agent_version);
 
                         // Tìm địa chỉ dialable cụ thể của Relay (không chứa /p2p-circuit)
@@ -880,6 +905,8 @@ impl P2PEventLoop {
                         } else {
                             warn!("⚠️ Phát hiện Relay {} nhưng chưa có địa chỉ mạng cụ thể để tạo reservation", peer_id);
                         }
+                    } else {
+                        info!("🔎 [Storage Peer] Xác nhận peer {} là Storage Peer (agent={})", peer_id, info.agent_version);
                     }
                 }
             }
