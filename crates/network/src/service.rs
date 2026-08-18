@@ -242,16 +242,27 @@ impl P2PService {
         hashes: Vec<String>,
         target_count: usize,
     ) -> Result<Vec<Shard>, NetworkError> {
-        let (tx, rx) = oneshot::channel();
-        self.command_tx
-            .send(P2PCommand::FetchShardsParallel {
-                hashes,
-                target_count,
-                respond_to: tx,
-            })
-            .await
-            .map_err(|e| NetworkError::ChannelClosed(e.to_string()))?;
-        rx.await.map_err(|e| NetworkError::ChannelClosed(e.to_string()))?
+        let mut attempts = 0;
+        loop {
+            let (tx, rx) = oneshot::channel();
+            self.command_tx
+                .send(P2PCommand::FetchShardsParallel {
+                    hashes: hashes.clone(),
+                    target_count,
+                    respond_to: tx,
+                })
+                .await
+                .map_err(|e| NetworkError::ChannelClosed(e.to_string()))?;
+
+            match rx.await.map_err(|e| NetworkError::ChannelClosed(e.to_string()))? {
+                Ok(shards) => return Ok(shards),
+                Err(NetworkError::NoPeersAvailable) if attempts < 4 => {
+                    attempts += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     pub async fn get_connected_peers(&self) -> Result<Vec<PeerId>, NetworkError> {
