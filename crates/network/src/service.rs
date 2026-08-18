@@ -1249,18 +1249,36 @@ impl P2PEventLoop {
                                         }
                                     }
 
-                                    // Sắp xếp ưu tiên: Shard nào có nhiều bản sao trùng lặp nhất trên toàn mạng -> Thu hồi trước
-                                    let mut sorted_shards = shards.clone();
-                                    sorted_shards.sort_by(|a, b| {
+                                    // 1. Phân loại shards thành 2 tầng ưu tiên (2-Tier Pruning):
+                                    // Tier 1: Các shard trùng lặp (có từ 2 bản sao trở lên trên toàn mạng) -> Ưu tiên xóa sạch trước
+                                    // Tier 2: Các shard độc bản (chỉ node này đang giữ) -> Chỉ xóa sau cùng nếu toàn mạng vẫn còn vượt 50
+                                    let mut duplicate_shards: Vec<String> = Vec::new();
+                                    let mut unique_shards: Vec<String> = Vec::new();
+
+                                    for hash in shards {
+                                        let count = shard_replica_count.get(&hash).cloned().unwrap_or(1);
+                                        if count > 1 {
+                                            duplicate_shards.push(hash);
+                                        } else {
+                                            unique_shards.push(hash);
+                                        }
+                                    }
+
+                                    // Sắp xếp Tier 1 theo số lượng bản sao giảm dần (nhiều bản sao nhất xóa trước)
+                                    duplicate_shards.sort_by(|a, b| {
                                         let count_a = shard_replica_count.get(a).cloned().unwrap_or(1);
                                         let count_b = shard_replica_count.get(b).cloned().unwrap_or(1);
                                         count_b.cmp(&count_a)
                                     });
 
+                                    // Ghép danh sách: Xử lý TOÀN BỘ bản trùng lặp trước, bản không trùng xử lý sau cùng
+                                    let mut prune_candidate_shards = duplicate_shards;
+                                    prune_candidate_shards.extend(unique_shards);
+
                                     let mut pruned_count = 0;
                                     let mut final_r = current_r;
 
-                                    for hash in sorted_shards {
+                                    for hash in prune_candidate_shards {
                                         if pruned_count >= my_prune_quota {
                                             break;
                                         }
