@@ -94,8 +94,26 @@ impl BlockStore {
     /// Trả về `true` nếu shard đã tồn tại và bị xóa, `false` nếu không tìm thấy.
     pub fn delete_shard(&self, hash: &str) -> Result<bool, BlockStoreError> {
         let prev = self.db.remove(hash.as_bytes())?;
+        if let Ok(tree) = self.db.open_tree("shard_to_file") {
+            let _ = tree.remove(hash.as_bytes());
+        }
         self.db.flush()?;
         Ok(prev.is_some())
+    }
+
+    /// Đếm số lượng shards thuộc về một file cụ thể (`file_cid`).
+    pub fn count_shards_for_file(&self, file_cid: &str) -> Result<usize, BlockStoreError> {
+        let tree = self.db.open_tree("shard_to_file")?;
+        let mut count = 0;
+        for item in tree.iter() {
+            let (_, v) = item?;
+            if let Ok(s) = std::str::from_utf8(&v) {
+                if s == file_cid {
+                    count += 1;
+                }
+            }
+        }
+        Ok(count)
     }
 
     /// Trả về dung lượng ổ đĩa thực tế mà cơ sở dữ liệu `BlockStore` đang chiếm dụng (bytes).

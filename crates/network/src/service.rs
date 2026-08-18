@@ -303,8 +303,8 @@ struct P2PEventLoop {
     known_relays: HashSet<Multiaddr>,
     known_peer_addrs: HashMap<PeerId, HashSet<Multiaddr>>,
     pending_fetches: HashMap<request_response::OutboundRequestId, usize>,
-    pending_pushes: HashMap<request_response::OutboundRequestId, (PeerId, String)>,
-    peer_shards: HashMap<PeerId, HashSet<String>>,
+    pending_pushes: HashMap<request_response::OutboundRequestId, (PeerId, String, String)>,
+    peer_shards: HashMap<PeerId, HashMap<String, String>>,
     peer_r_ratios: HashMap<PeerId, f64>,
     fetch_sessions: HashMap<usize, PendingFetchRequest>,
     next_fetch_session_id: usize,
@@ -426,7 +426,7 @@ impl P2PEventLoop {
                 continue;
             }
 
-            let in_flight = self.pending_pushes.values().filter(|(p, _)| p == &peer).count();
+            let in_flight = self.pending_pushes.values().filter(|(p, _, _)| p == &peer).count();
             if in_flight >= 1 {
                 // Đang có 1 shard in-flight đang truyền, đợi truyền xong mới gửi shard tiếp theo
                 continue;
@@ -434,21 +434,25 @@ impl P2PEventLoop {
 
             // Tìm đúng 1 Shard tiếp theo mà peer này chưa lưu trữ
             for hash in &my_hashes {
-                let already_has = self.peer_shards.get(&peer).map(|s| s.contains(hash)).unwrap_or(false);
-                let already_in_flight = self.pending_pushes.values().any(|(p, h)| p == &peer && h == hash);
+                let already_has = self.peer_shards.get(&peer).map(|s| s.contains_key(hash)).unwrap_or(false);
+                let already_in_flight = self.pending_pushes.values().any(|(p, h, _)| p == &peer && h == hash);
                 if !already_has && !already_in_flight {
                     if let Ok(Some(data)) = self.blockstore.get_shard(hash) {
                         let shard_kb = data.len() as f64 / 1024.0;
                         let file_cid = self.blockstore.get_file_cid_for_shard(hash).unwrap_or(None);
+                        let current_file_cid = file_cid.unwrap_or_else(|| "default_file".to_string());
                         let req = ShardRequest::Push(crate::protocol::PushShard {
                             hash: hash.clone(),
-                            file_cid,
+                            file_cid: Some(current_file_cid.clone()),
                             data,
                         });
-                        let held_count = self.peer_shards.get(&peer).map(|s| s.len()).unwrap_or(0);
-                        info!("📤 [Mesh Diffusion] Đang gửi 1 shard {}... ({:.2} KB) sang peer {} (R={:.2}, hiện giữ {} shards)", &hash[..12], shard_kb, peer, peer_r, held_count);
+                        let held_count = self.peer_shards.get(&peer)
+                            .map(|s| s.values().filter(|cid| *cid == &current_file_cid).count())
+                            .unwrap_or(0);
+                        let short_cid = if current_file_cid.len() > 12 { &current_file_cid[..12] } else { &current_file_cid };
+                        info!("📤 [Mesh Diffusion] Đang gửi 1 shard {}... ({:.2} KB) sang peer {} (R={:.2}, hiện giữ {} shards của file {})", &hash[..12], shard_kb, peer, peer_r, held_count, short_cid);
                         let req_id = self.swarm.behaviour_mut().request_response.send_request(&peer, req);
-                        self.pending_pushes.insert(req_id, (peer, hash.clone()));
+                        self.pending_pushes.insert(req_id, (peer, hash.clone(), current_file_cid));
                         break; // Mỗi chu kỳ chỉ gửi đúng 1 shard cho peer này
                     }
                 }
@@ -623,7 +627,7 @@ impl P2PEventLoop {
                             data: shard.data.clone(),
                         });
                         let req_id = self.swarm.behaviour_mut().request_response.send_request(target_peer, req);
-                        self.pending_pushes.insert(req_id, (*target_peer, shard.hash.clone()));
+                        self.pending_pushes.insert(req_id, (*target_peer, shard.hash.clone(), f_cid.to_string()));
                     }
                 }
 
@@ -856,9 +860,10 @@ impl P2PEventLoop {
                             let relay_with_id = ensure_relay_peer_id(base_addr, &peer_id);
                             self.known_relays.insert(relay_with_id.clone());
 
-                            if !self.reserved_relays.contains(&peer_id) && !self.pending_reservations.contains(&peer_id) {
+                            // Chỉ gửi yêu cầu nếu node chưa có bất kỳ Relay Circuit nào đang hoạt động
+                            if self.reserved_relays.is_empty() && self.pending_reservations.is_empty() {
                                 let circuit_addr = relay_with_id.with(libp2p::multiaddr::Protocol::P2pCircuit);
-                                info!("🔗 [Identify] Đang đăng ký Relay Circuit Reservation tại: {}", circuit_addr);
+                                info!("🔗 [Identify] Chọn Relay {} làm trạm kết nối Circuit chính: {}", peer_id, circuit_addr);
                                 match self.swarm.listen_on(circuit_addr) {
                                     Ok(_) => {
                                         self.pending_reservations.insert(peer_id);
@@ -867,6 +872,8 @@ impl P2PEventLoop {
                                         warn!("❌ [Identify] Lỗi đăng ký circuit_addr trên Relay {}: {}", peer_id, e);
                                     }
                                 }
+                            } else if !self.reserved_relays.is_empty() {
+                                debug!("ℹ️ Node đã có Relay Circuit hoạt động, bỏ qua không tạo thêm circuit trên Relay {}", peer_id);
                             }
                         } else {
                             warn!("⚠️ Phát hiện Relay {} nhưng chưa có địa chỉ mạng cụ thể để tạo reservation", peer_id);
@@ -979,7 +986,10 @@ impl P2PEventLoop {
                         let key = RecordKey::new(&push.hash.as_bytes());
                         let _ = self.swarm.behaviour_mut().kademlia.start_providing(key);
 
-                        info!("📥 [Mesh Cache] Đã nhận và lưu trữ thành công shard cache {} ({:.2} KB) từ peer {}", push.hash, shard_len as f64 / 1024.0, peer);
+                        let f_cid = push.file_cid.as_deref().unwrap_or("default_file");
+                        let local_file_shards = self.blockstore.count_shards_for_file(f_cid).unwrap_or(0);
+                        let short_cid = if f_cid.len() > 12 { &f_cid[..12] } else { f_cid };
+                        info!("📥 [Mesh Cache] Đã nhận và lưu trữ thành công shard cache {} ({:.2} KB) từ peer {} (Hiện giữ: {} shards của file {})", &push.hash[..12], shard_len as f64 / 1024.0, peer, local_file_shards, short_cid);
                         let resp = ShardResponse::Push(PushResponse {
                             accepted: true,
                             reason: None,
@@ -1085,8 +1095,11 @@ impl P2PEventLoop {
                                 if let Some(r) = node.r_ratio {
                                     self.peer_r_ratios.insert(pid, r);
                                 }
-                                let shard_set: HashSet<String> = node.held_shards.iter().map(|s| s.shard_hash.clone()).collect();
-                                self.peer_shards.insert(pid, shard_set);
+                                let mut shard_map: HashMap<String, String> = HashMap::new();
+                                for s in &node.held_shards {
+                                    shard_map.insert(s.shard_hash.clone(), s.file_cid.clone());
+                                }
+                                self.peer_shards.insert(pid, shard_map);
                             }
                         }
                     }
@@ -1176,14 +1189,17 @@ impl P2PEventLoop {
                 }
 
                 if let ShardResponse::Push(PushResponse { accepted, reason }) = &response {
-                    if let Some((target_peer, hash)) = self.pending_pushes.remove(&request_id) {
+                    if let Some((target_peer, hash, file_cid)) = self.pending_pushes.remove(&request_id) {
                         if *accepted {
-                            self.peer_shards.entry(target_peer).or_default().insert(hash);
-                            let count = self.peer_shards.get(&target_peer).map(|s| s.len()).unwrap_or(0);
-                            info!("✅ [Mesh Diffusion] Peer {} đã chấp nhận và lưu trữ shard cache! (Tổng shards đang giữ: {})", target_peer, count);
+                            self.peer_shards.entry(target_peer).or_default().insert(hash, file_cid.clone());
+                            let count = self.peer_shards.get(&target_peer)
+                                .map(|s| s.values().filter(|cid| *cid == &file_cid).count())
+                                .unwrap_or(0);
+                            let short_cid = if file_cid.len() > 12 { &file_cid[..12] } else { &file_cid };
+                            info!("✅ [Mesh Diffusion] Peer {} đã chấp nhận và lưu trữ shard cache! (Hiện giữ: {} shards của file {})", target_peer, count, short_cid);
                         } else {
                             // Ghi nhận shard này đã xử lý với peer để không gửi lặp lại
-                            self.peer_shards.entry(target_peer).or_default().insert(hash);
+                            self.peer_shards.entry(target_peer).or_default().insert(hash, file_cid);
                             if let Some(r_str) = reason {
                                 if r_str.contains("trần cache") || r_str.contains("R > 5.0") || r_str.contains("hạn mức") {
                                     self.peer_r_ratios.insert(target_peer, 5.0);
@@ -1209,7 +1225,7 @@ impl P2PEventLoop {
 
                                     if session.collected_shards.len() >= session.target_count {
                                         if let Some(finished_session) =
-                                            self.fetch_sessions.remove(&session_id)
+                                             self.fetch_sessions.remove(&session_id)
                                         {
                                             let _ = finished_session
                                                 .respond_to
@@ -1239,6 +1255,7 @@ impl P2PEventLoop {
             }
             request_response::Event::OutboundFailure { peer, request_id, error, .. } => {
                 warn!("⚠️ [Mesh Diffusion] Lỗi gửi yêu cầu Shard sang peer {} (request_id={}): {:?}", peer, request_id, error);
+                self.pending_pushes.remove(&request_id);
                 if let Some(session_id) = self.pending_fetches.remove(&request_id) {
                     let has_remaining = self.pending_fetches.values().any(|&sid| sid == session_id);
                     if !has_remaining {
